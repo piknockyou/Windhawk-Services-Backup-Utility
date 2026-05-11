@@ -9,7 +9,7 @@
 ![Version](https://img.shields.io/badge/Version-2.8.8--pyw-green)
 ![License](https://img.shields.io/badge/License-GPL-yellow)
 
-<img width="822" height="712" alt="image" src="https://github.com/user-attachments/assets/d844f321-fb90-4db1-a208-199142309970" />
+<img width="922" height="859" alt="image" src="https://github.com/user-attachments/assets/26908127-fc24-4fc7-ba7a-d59641641e86" />
 
 ---
 
