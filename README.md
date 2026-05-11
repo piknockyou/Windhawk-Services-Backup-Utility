@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
-![Version](https://img.shields.io/badge/Version-2.5.5--pyw-green)
+![Version](https://img.shields.io/badge/Version-2.8.8--pyw-green)
 ![License](https://img.shields.io/badge/License-GPL-yellow)
 
 <img width="822" height="712" alt="image" src="https://github.com/user-attachments/assets/d844f321-fb90-4db1-a208-199142309970" />
@@ -18,6 +18,8 @@
 ### Core backup / restore
 - **One‑click backup** of mod sources, compiled mods, and registry settings into a timestamped ZIP
 - **One‑click restore** from any existing archive  
+- **Clean Existing State** – dedicated maintenance tool to wipe stale mod state (sources, compiled DLLs, UI caches, registry) while preserving Windhawk's core runtime files, guaranteeing a deterministic restore baseline
+- **Smart Stale DLL Exclusion** – automatically detects and drops obsolete compiled mod binaries during backup, preventing historical artifact buildup
 - **Service management** – automatically stops Windhawk before file operations and restarts it afterwards, even on errors  
 - **Archive integrity check** – every new backup is validated with `zipfile.testzip()`  
 - **Backup rotation** – keeps only the last *N* archives (configurable, 0 = unlimited)
@@ -37,11 +39,11 @@
 
 ### UI / UX
 - **Help & README** button – opens a tabbed dialog with detailed documentation  
-- **Sortable backup list** – click column headers; toggles ascending / descending  
+- **Live auto-refresh** – backup list automatically updates in the background without UI flickering
+- **Sortable & auto-sizing backup list** – columns automatically fit content; double-click separators to auto-fit
 - **Backup preview** – double‑click any archive to see its mod list, metadata, and full manifest  
-- **Debounced auto‑save** – settings are saved 1 second after any change  
-- **Spinbox validation** – invalid values in the “keep last” field are reset to the default  
-- **Timestamped operation log** with colour‑coded entries and export to `.txt`  
+- **Debounced auto‑save** – settings are saved silently 1 second after any change  
+- **Advanced Logging** – features a toggleable Verbose mode (file-level tracking), a Large View window, end-of-operation summaries, and line-by-line color coding
 - **Status bar** and **threaded operations** – UI stays responsive during backup/restore
 
 ### Other improvements
@@ -67,13 +69,14 @@
 
 ### Backup
 1. Verify the **Windhawk Root** and **Backup Base Folder** fields.  
-2. Optionally adjust the **number of backups to keep** or toggle **Portable installation**.  
-3. Click **Create Backup** – the service is stopped, files copied, registry exported, ZIP created, and the service restarted.
+2. Optionally adjust the **number of backups to keep**, or toggle **Exclude stale DLLs**.  
+3. Click **Create Backup** – the service is stopped, files staged, obsolete DLLs dropped, registry exported, ZIP created, and the service restarted.
 
-### Restore
-1. Select a backup from the list (double‑click to preview its contents first).  
-2. Click **Restore Selected** and confirm the overwrite prompt.  
-3. If the backup’s CPU architecture differs from your machine, a warning will appear in the log – **pay attention to it** (see *Architecture note* below).
+### Restore & Maintenance
+1. **Highly Recommended:** Click **Clean Existing State** first. This safely wipes old compiled DLLs and out-of-sync UI caches, ensuring the destination is perfectly clean.
+2. Select a backup from the list (double‑click to preview its contents first).  
+3. Click **Restore Selected** and confirm the overwrite prompt.  
+4. If the backup’s CPU architecture differs from your machine, a warning will appear in the log – **pay attention to it** (see *Architecture note* below).
 
 ### Portable installations
 - Tick **Portable installation** to skip all registry steps, or click **Auto‑Detect** to let the tool decide (it checks for the registry key).
@@ -107,40 +110,6 @@ The mod *source* (`ModsSource`) and registry settings are architecture‑agnosti
 
 ---
 
-## Changelog
-
-### 2.5.5‑pyw (this fork)
-- 🏗️ Config now lives next to the script – portable by design; auto‑migration from old AppData location
-- 🧠 Backup filenames enriched with hostname and CPU architecture
-- 📦 Manifest extended with `arch` and `hostname` fields
-- ⚠️ Architecture mismatch warning on restore
-- 🔍 Smarter Windhawk root auto‑detection (multiple candidate paths)
-- 📖 New Help & README button with tabbed documentation
-- ↕️ Treeview columns toggle ascending/descending on click
-- 💾 Debounced auto‑save for all settings
-- ✅ Input validation on backup count spinbox
-- 🔐 Elevation fix for `.pyw` files
-- 🗂️ Optional backup subfolder toggling
-
-### 2.5.0 (upstream)
-- Backup archive list with sortable columns and zebra striping
-- Backup preview dialog (double‑click) showing full mod list and metadata
-- `manifest.json` inside each archive
-- Backup rotation (configurable max backups)
-- Persistent settings (`%AppData%`)
-- Timestamped log entries and log export
-- Status bar
-- Service stop/start around all file operations
-- Archive integrity check
-- Windhawk root validation
-- Portable installation checkbox and auto‑detect
-- Background threading (non‑freezing UI)
-
-### 2.1.1 (original)
-- Initial release
-
----
-
 ## Acknowledgments
 
 - Original idea and UI‑first PowerShell script by [@lokize](https://github.com/lokize) ([comment](https://github.com/ramensoftware/windhawk/issues/195#issuecomment-3184189085))
@@ -151,5 +120,3 @@ The mod *source* (`ModsSource`) and registry settings are architecture‑agnosti
 ## License
 
 GPL License – see [LICENSE](LICENSE) for details.
-
-
