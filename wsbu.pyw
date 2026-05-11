@@ -607,7 +607,6 @@ class WindhawkManagerApp:
         self.root.minsize(740, 580)
 
         self._apply_style()
-        self._set_window_icon()
 
         self._cfg = load_config()
 
@@ -641,7 +640,7 @@ class WindhawkManagerApp:
         self._setup_variable_traces()
 
     # ------------------------------------------------------------------
-    # Styling / icon
+    # Styling
     # ------------------------------------------------------------------
 
     def _apply_style(self) -> None:
@@ -662,32 +661,6 @@ class WindhawkManagerApp:
                     background="#F0F0F0")
         s.configure("StatusBar.TFrame",
                     background="#F0F0F0", relief="sunken")
-
-    def _set_window_icon(self) -> None:
-        """
-        Sets a simple programmatic icon so the window has a recognisable
-        entry in the taskbar without needing an external .ico file.
-        Uses a 16x16 XBM bitmap rendered as a PhotoImage.
-        Falls back silently on any error.
-        """
-        try:
-            # 16x16 simple 'W' shape as XBM data
-            xbm = (
-                "#define img_width 16\n"
-                "#define img_height 16\n"
-                "static unsigned char img_bits[] = {\n"
-                "   0xff, 0xff, 0x03, 0xc0, 0x03, 0xc0, 0x03, 0xc0,\n"
-                "   0x63, 0xc6, 0x63, 0xc6, 0x63, 0xc6, 0x63, 0xc6,\n"
-                "   0x63, 0xc6, 0x77, 0xee, 0x3e, 0x7c, 0x1c, 0x38,\n"
-                "   0x08, 0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff};\n"
-            )
-            img = tk.BitmapImage(data=xbm, foreground="#1E6FA5",
-                                 background="#FFFFFF")
-            self.root.iconbitmap(bitmap=img)
-            # Keep a reference so GC doesn't collect it
-            self.root._icon_ref = img  # type: ignore[attr-defined]
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------
     # UI builders
