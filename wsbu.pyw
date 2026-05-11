@@ -1,14 +1,16 @@
 # =============================================================================
-#  Windhawk Service Management Utility - Version 2.5.0
-#  Author: scorpion421
-#  Description: A tool for backing up and restoring Windhawk configurations.
+#  Windhawk Service Management Utility - Version 2.5.3-pyw
+#  Based on wsbu.py by scorpion421 (GPL)
 # =============================================================================
 
 import ctypes
 import datetime
 import json
 import os
+import platform
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -22,7 +24,7 @@ from tkinter import ttk
 # ---------------------------------------------------------------------------
 # Application constants
 # ---------------------------------------------------------------------------
-APP_VERSION   = "2.5.0"
+APP_VERSION   = "2.5.5-pyw"
 APP_TITLE     = f"Windhawk Service Management Utility v{APP_VERSION}"
 
 WINDHAWK_REGISTRY_KEY   = r"SOFTWARE\Windhawk"
@@ -30,11 +32,28 @@ WINDHAWK_SERVICE_NAME   = "Windhawk"
 WINDHAWK_ROOT_SENTINELS = ("ModsSource", os.path.join("Engine", "Mods"), "windhawk.exe")
 
 DEFAULT_WINDHAWK_ROOT = os.path.expandvars(r"%programdata%\Windhawk")
-DEFAULT_BACKUP_FOLDER = os.path.expandvars(r"%userprofile%\Documents\Windhawk_Backup")
+_SCRIPT_DIR           = (os.path.dirname(os.path.abspath(sys.argv[0]))
+                         if sys.argv and sys.argv[0]
+                         else os.path.expanduser("~"))
+DEFAULT_BACKUP_FOLDER = _SCRIPT_DIR
+BACKUP_SUBFOLDER_NAME = "Windhawk_Backup"
 DEFAULT_MAX_BACKUPS   = 10
 
-CONFIG_DIR  = os.path.expandvars(r"%appdata%\Windhawk_Backup_Utility")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+# Candidate paths probed in order when auto-detecting the Windhawk root.
+WINDHAWK_ROOT_CANDIDATES = [
+    os.path.expandvars(r"%programdata%\Windhawk"),
+    os.path.expandvars(r"%localappdata%\Windhawk"),
+    r"C:\Windhawk",
+    r"C:\Program Files\Windhawk",
+    r"C:\Program Files (x86)\Windhawk",
+    os.path.join(_SCRIPT_DIR, "Windhawk"),
+]
+
+# Config file lives next to the script and mirrors the script’s basename
+CONFIG_FILE = os.path.join(
+    _SCRIPT_DIR,
+    f"{os.path.splitext(os.path.basename(sys.argv[0]))[0]}.config.json",
+)
 
 PAD = 8  # Universal spacing unit used throughout the UI
 
@@ -47,26 +66,53 @@ PAD = 8  # Universal spacing unit used throughout the UI
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
-    """Loads settings from the JSON config file, merging with built-in defaults."""
+    """
+    Load settings from the JSON config file next to the script.
+    Falls back to the old AppData location (v2.5.4 and earlier) if no
+    local config exists, then migrates it to the new location.
+    """
     defaults = {
         "windhawk_root": DEFAULT_WINDHAWK_ROOT,
         "backup_folder": DEFAULT_BACKUP_FOLDER,
         "portable":      False,
         "max_backups":   DEFAULT_MAX_BACKUPS,
+        "use_subfolder": True,
     }
+
+    # 1) Try the new location first (next to the script)
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
             stored = json.load(fh)
         defaults.update(stored)
+        return defaults
     except (OSError, json.JSONDecodeError):
         pass
+
+    # 2) New config missing – check the legacy AppData location
+    legacy_dir  = os.path.expandvars(r"%appdata%\Windhawk_Backup_Utility")
+    legacy_file = os.path.join(legacy_dir, "config.json")
+    try:
+        with open(legacy_file, "r", encoding="utf-8") as fh:
+            stored = json.load(fh)
+        defaults.update(stored)
+        # Migrate to the new location (best effort – failure is non‑fatal)
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+                json.dump(defaults, fh, indent=2)
+        except OSError:
+            pass
+    except (OSError, json.JSONDecodeError):
+        pass
+
     return defaults
 
 
 def save_config(cfg: dict) -> None:
-    """Persists settings to the JSON config file. Failure is non-fatal."""
+    """Persists settings to the JSON config file next to the script. Failure is non-fatal."""
     try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        # The directory of CONFIG_FILE is the script directory, which already exists.
+        # We still call makedirs just in case the script was placed in a different spot.
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)
     except OSError:
@@ -107,17 +153,17 @@ def list_backups(backup_folder: str) -> list[dict]:
             mtime = os.path.getmtime(full_path)
             dt    = datetime.datetime.fromtimestamp(mtime)
 
-            manifest:  dict     = {}
+            manifest:  dict       = {}
             mod_count: int | None = None
             try:
                 with zipfile.ZipFile(full_path, "r") as zf:
-                    names = zf.namelist()
-                    if "manifest.json" in names:
+                    znames = zf.namelist()
+                    if "manifest.json" in znames:
                         manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
                     else:
-                        # Legacy archive: normalize separators first (Windows
-                        # shutil.make_archive uses backslashes in ZIP entries).
-                        normalized = [n.replace("\\", "/") for n in names]
+                        # Legacy archive: normalise separators (Windows shutil
+                        # make_archive can use backslashes in ZIP entries).
+                        normalized = [n.replace("\\", "/") for n in znames]
                         mod_count = sum(
                             1 for n in normalized
                             if n.startswith("ModsSource/") and n.endswith(".wh.cpp")
@@ -125,7 +171,6 @@ def list_backups(backup_folder: str) -> list[dict]:
             except Exception:
                 pass
 
-            # Prefer manifest value, fall back to counted value, then "-"
             mods_display = str(
                 manifest.get("mod_count", mod_count)
                 if "mod_count" in manifest or mod_count is not None
@@ -145,29 +190,31 @@ def list_backups(backup_folder: str) -> list[dict]:
     return results
 
 
-def create_manifest(windhawk_root: str, portable: bool) -> dict:
+def create_manifest(windhawk_root: str, portable: bool, hostname: str = "") -> dict:
     """Builds a metadata dict to be stored as manifest.json inside the archive."""
     mods: list[str] = []
     mods_dir = os.path.join(windhawk_root, "ModsSource")
     if os.path.isdir(mods_dir):
         mods = [f for f in os.listdir(mods_dir) if f.endswith(".wh.cpp")]
-    # Strip the .wh.cpp suffix for readability in the manifest mod list.
-    mod_names = [f[:-7] for f in mods]
-    return {
+    mod_names = [f[:-7] for f in mods]  # strip .wh.cpp suffix
+    manifest = {
         "app_version":   APP_VERSION,
         "created":       datetime.datetime.now().isoformat(timespec="seconds"),
         "windhawk_root": windhawk_root,
         "portable":      portable,
+        "arch":          platform.machine(),
         "mods":          mod_names,
         "mod_count":     len(mod_names),
     }
+    if hostname:
+        manifest["hostname"] = hostname
+    return manifest
 
 
 def rotate_backups(backup_folder: str, max_backups: int) -> list[str]:
     """
     Deletes the oldest backup archives when the total exceeds max_backups.
-    A value of 0 disables rotation entirely.
-    Returns the list of deleted filenames.
+    A value of 0 disables rotation entirely. Returns deleted filenames.
     """
     if max_backups <= 0 or not os.path.isdir(backup_folder):
         return []
@@ -210,13 +257,20 @@ def is_admin() -> bool:
 def run_as_admin() -> bool:
     """
     Re-launches this script with elevated privileges via ShellExecute.
-    Paths containing spaces are quoted correctly.
-    Returns True if the elevation request was submitted successfully.
+
+    FIX vs 2.5.0: when running as .pyw, sys.executable is pythonw.exe.
+    ShellExecuteW takes (program, parameters) separately, so we pass
+    sys.executable as the program and build parameters as:
+        "<script_path>" [extra args...]
+    This avoids the script path being double-quoted inside a single args
+    string that already starts with it.
     """
     try:
-        args   = " ".join(f'"{a}"' for a in sys.argv)
+        script = os.path.abspath(sys.argv[0])
+        extra  = sys.argv[1:]
+        params = " ".join([f'"{script}"'] + [f'"{a}"' for a in extra])
         result = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, args, None, 1
+            None, "runas", sys.executable, params, None, 1
         )
         return int(result) > 32
     except Exception:
@@ -229,6 +283,17 @@ def validate_windhawk_root(path: str) -> bool:
     given root path, preventing operations on obviously wrong directories.
     """
     return any(os.path.exists(os.path.join(path, s)) for s in WINDHAWK_ROOT_SENTINELS)
+
+
+def detect_windhawk_root() -> str | None:
+    """
+    Probes WINDHAWK_ROOT_CANDIDATES in order and returns the first path
+    that passes validate_windhawk_root(), or None if nothing is found.
+    """
+    for candidate in WINDHAWK_ROOT_CANDIDATES:
+        if validate_windhawk_root(candidate):
+            return candidate
+    return None
 
 
 def _run_sc(action: str) -> tuple[bool, str]:
@@ -276,11 +341,9 @@ def execute_backup_operation(
     Backs up Windhawk mod sources, compiled mods, a manifest.json, and
     (unless portable) the registry key into a timestamped ZIP archive.
 
-    The Windhawk service is stopped before file access and restarted
-    afterwards via try/finally. The resulting archive is validated with
-    zipfile.testzip(). Old backups are rotated if max_backups > 0.
-
-    Returns (success, log_text).
+    Service is stopped before file access and restarted afterwards via
+    try/finally. Archive is validated with zipfile.testzip(). Old backups
+    are rotated if max_backups > 0.
     """
     log: list[str] = []
 
@@ -295,8 +358,12 @@ def execute_backup_operation(
     except OSError as exc:
         return False, f"ERROR: Could not create backup folder: {exc}"
 
+    arch         = platform.machine()
+    hostname_raw = platform.node() or socket.gethostname() or "unknown"
+    hostname     = re.sub(r'[^A-Za-z0-9_-]+', '_', hostname_raw).strip('_')[:32]
     timestamp    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    archive_base = os.path.join(backup_folder, f"windhawk-backup_{timestamp}")
+    archive_base = os.path.join(backup_folder,
+                                f"windhawk-backup_{hostname}_{arch}_{timestamp}")
 
     if not portable:
         ok, msg = stop_windhawk_service()
@@ -307,7 +374,7 @@ def execute_backup_operation(
     try:
         with tempfile.TemporaryDirectory() as stage_dir:
 
-            # Step 1 - Stage mod directories
+            # Step 1 – Stage mod directories
             for rel, src in {
                 "ModsSource":                   os.path.join(windhawk_root, "ModsSource"),
                 os.path.join("Engine", "Mods"): os.path.join(windhawk_root, "Engine", "Mods"),
@@ -322,23 +389,24 @@ def execute_backup_operation(
                 else:
                     log.append(f"Warning: Not found, skipping: {src}")
 
-            # Step 2 - Write manifest
+            # Step 2 – Write manifest
             try:
                 manifest_path = os.path.join(stage_dir, "manifest.json")
                 with open(manifest_path, "w", encoding="utf-8") as fh:
-                    json.dump(create_manifest(windhawk_root, portable), fh, indent=2)
+                    json.dump(create_manifest(windhawk_root, portable, hostname), fh, indent=2)
                 log.append("Status: Manifest written.")
             except OSError as exc:
                 log.append(f"Warning: Could not write manifest: {exc}")
 
-            # Step 3 - Export registry key
+            # Step 3 – Export registry key
             if portable:
                 log.append("Info: Portable mode - registry export skipped.")
             else:
                 reg_file = os.path.join(stage_dir, "Windhawk.reg")
                 try:
                     subprocess.run(
-                        ["reg", "export", f"HKLM\\{WINDHAWK_REGISTRY_KEY}", reg_file, "/y"],
+                        ["reg", "export",
+                         f"HKLM\\{WINDHAWK_REGISTRY_KEY}", reg_file, "/y"],
                         check=True, capture_output=True, text=True,
                         creationflags=subprocess.CREATE_NO_WINDOW,
                     )
@@ -347,14 +415,14 @@ def execute_backup_operation(
                     log.append(f"ERROR: Registry export failed: {exc.stderr.strip()}")
                     return False, "\n".join(log)
 
-            # Step 4 - Create archive
+            # Step 4 – Create archive
             try:
                 shutil.make_archive(archive_base, "zip", stage_dir)
             except OSError as exc:
                 log.append(f"ERROR: Archive creation failed: {exc}")
                 return False, "\n".join(log)
 
-            # Step 5 - Validate archive integrity
+            # Step 5 – Validate archive integrity
             archive_path = f"{archive_base}.zip"
             try:
                 with zipfile.ZipFile(archive_path, "r") as zf:
@@ -378,7 +446,7 @@ def execute_backup_operation(
             _, msg = start_windhawk_service()
             log.append(msg)
 
-    # Step 6 - Rotate old backups
+    # Step 6 – Rotate old backups
     deleted = rotate_backups(backup_folder, max_backups)
     for name in deleted:
         log.append(f"Info: Rotation - deleted old backup: {name}")
@@ -389,13 +457,8 @@ def execute_backup_operation(
 def _resolve_nested_source(path: str) -> tuple[str, bool]:
     """
     Detects and resolves one level of same-name nesting inside a directory.
-
     If 'path' contains a direct subdirectory whose name matches the last
-    component of 'path' (e.g. ModsSource/ModsSource or Engine/Mods/Mods),
-    that subdirectory is returned as the real source so the restore does not
-    reproduce the nesting on disk.
-
-    Returns (resolved_path, was_nested).
+    component of 'path', that subdirectory is returned as the real source.
     """
     folder_name = os.path.basename(path)
     nested = os.path.join(path, folder_name)
@@ -412,11 +475,7 @@ def execute_restore_operation(
     """
     Restores mod sources, compiled mods, and (unless portable) registry
     settings from a previously created ZIP archive.
-
-    The Windhawk service is stopped before file access and restarted
-    afterwards via try/finally.
-
-    Returns (success, log_text).
+    Service is stopped before file access and restarted afterwards.
     """
     log: list[str] = []
 
@@ -435,7 +494,7 @@ def execute_restore_operation(
     try:
         with tempfile.TemporaryDirectory() as stage_dir:
 
-            # Step 1 - Extract archive
+            # Step 1 – Extract archive
             try:
                 shutil.unpack_archive(archive_path, stage_dir)
                 log.append(f"Status: '{os.path.basename(archive_path)}' extracted.")
@@ -443,7 +502,24 @@ def execute_restore_operation(
                 log.append(f"ERROR: Extraction failed: {exc}")
                 return False, "\n".join(log)
 
-            # Step 2 - Restore mod directories
+            # Arch mismatch check
+            try:
+                mf_path = os.path.join(stage_dir, "manifest.json")
+                if os.path.isfile(mf_path):
+                    with open(mf_path, "r", encoding="utf-8") as fh:
+                        _mf = json.load(fh)
+                    arch_bak = _mf.get("arch", "")
+                    arch_cur = platform.machine()
+                    if arch_bak and arch_cur and arch_bak != arch_cur:
+                        log.append(
+                            f"Warning: Architecture mismatch — backup was created on "
+                            f"{arch_bak}, this machine is {arch_cur}. "
+                            f"Compiled mods may not work."
+                        )
+            except Exception:
+                pass
+
+            # Step 2 – Restore mod directories
             for label, (src, dst) in {
                 "ModsSource": (
                     os.path.join(stage_dir, "ModsSource"),
@@ -459,7 +535,7 @@ def execute_restore_operation(
                     if was_nested:
                         log.append(
                             f"Info: Nested structure detected in '{label}' - "
-                            f"using inner folder as source to prevent duplication."
+                            f"using inner folder to prevent duplication."
                         )
                     try:
                         shutil.copytree(real_src, dst, dirs_exist_ok=True)
@@ -469,7 +545,7 @@ def execute_restore_operation(
                 else:
                     log.append(f"Warning: '{label}' not found in archive, skipping.")
 
-            # Step 3 - Import registry key
+            # Step 3 – Import registry key
             if portable:
                 log.append("Info: Portable mode - registry import skipped.")
             else:
@@ -531,11 +607,26 @@ class WindhawkManagerApp:
         self.root.minsize(740, 580)
 
         self._apply_style()
+        self._set_window_icon()
 
         self._cfg = load_config()
 
+        # Sort state: col -> bool (True = ascending)
+        self._sort_ascending: dict[str, bool] = {c: True for c in self.TV_COLUMNS}
+
+        # Debounced auto-save
+        self._save_timer_id: str | None = None
+
         outer = ttk.Frame(root, padding=PAD)
         outer.pack(fill=tk.BOTH, expand=True)
+
+        # Top bar with Help & README button
+        top_bar = ttk.Frame(outer)
+        top_bar.pack(fill=tk.X, pady=(0, PAD))
+        ttk.Label(top_bar, text="Windhawk Backup Utility",
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Button(top_bar, text=" Help & README ", width=16,
+                   command=self._show_help_readme).pack(side=tk.RIGHT)
 
         self._build_config_section(outer)
         self._build_archive_section(outer)
@@ -547,9 +638,10 @@ class WindhawkManagerApp:
         self._refresh_backup_list()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._setup_variable_traces()
 
     # ------------------------------------------------------------------
-    # Styling
+    # Styling / icon
     # ------------------------------------------------------------------
 
     def _apply_style(self) -> None:
@@ -566,8 +658,36 @@ class WindhawkManagerApp:
                     troughcolor="#E4E4E4", background="#3A9BD5", thickness=5)
 
         s.configure("Status.TLabel",
-                    font=("Segoe UI", 8), foreground="#555555", background="#F0F0F0")
-        s.configure("StatusBar.TFrame", background="#F0F0F0", relief="sunken")
+                    font=("Segoe UI", 8), foreground="#555555",
+                    background="#F0F0F0")
+        s.configure("StatusBar.TFrame",
+                    background="#F0F0F0", relief="sunken")
+
+    def _set_window_icon(self) -> None:
+        """
+        Sets a simple programmatic icon so the window has a recognisable
+        entry in the taskbar without needing an external .ico file.
+        Uses a 16x16 XBM bitmap rendered as a PhotoImage.
+        Falls back silently on any error.
+        """
+        try:
+            # 16x16 simple 'W' shape as XBM data
+            xbm = (
+                "#define img_width 16\n"
+                "#define img_height 16\n"
+                "static unsigned char img_bits[] = {\n"
+                "   0xff, 0xff, 0x03, 0xc0, 0x03, 0xc0, 0x03, 0xc0,\n"
+                "   0x63, 0xc6, 0x63, 0xc6, 0x63, 0xc6, 0x63, 0xc6,\n"
+                "   0x63, 0xc6, 0x77, 0xee, 0x3e, 0x7c, 0x1c, 0x38,\n"
+                "   0x08, 0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff};\n"
+            )
+            img = tk.BitmapImage(data=xbm, foreground="#1E6FA5",
+                                 background="#FFFFFF")
+            self.root.iconbitmap(bitmap=img)
+            # Keep a reference so GC doesn't collect it
+            self.root._icon_ref = img  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # UI builders
@@ -584,16 +704,20 @@ class WindhawkManagerApp:
         # Windhawk root
         self.windhawk_path_var = tk.StringVar()
         ttk.Label(frame, text="Windhawk Root:").grid(row=0, column=0, **lbl)
-        ttk.Entry(frame, textvariable=self.windhawk_path_var).grid(row=0, column=1, **ent)
+        ttk.Entry(frame, textvariable=self.windhawk_path_var).grid(
+            row=0, column=1, **ent)
         ttk.Button(frame, text="Browse...", width=10,
-                   command=self._select_windhawk_path).grid(row=0, column=2, padx=(PAD, 0), pady=4)
+                   command=self._select_windhawk_path).grid(
+            row=0, column=2, padx=(PAD, 0), pady=4)
 
         # Backup folder
         self.backup_path_var = tk.StringVar()
-        ttk.Label(frame, text="Backup Folder:").grid(row=1, column=0, **lbl)
-        ttk.Entry(frame, textvariable=self.backup_path_var).grid(row=1, column=1, **ent)
+        ttk.Label(frame, text="Backup Base Folder:").grid(row=1, column=0, **lbl)
+        ttk.Entry(frame, textvariable=self.backup_path_var).grid(
+            row=1, column=1, **ent)
         ttk.Button(frame, text="Browse...", width=10,
-                   command=self._select_backup_path).grid(row=1, column=2, padx=(PAD, 0), pady=4)
+                   command=self._select_backup_path).grid(
+            row=1, column=2, padx=(PAD, 0), pady=4)
 
         # Options row
         opts = ttk.Frame(frame)
@@ -602,15 +726,31 @@ class WindhawkManagerApp:
         ttk.Label(opts, text="Keep last").pack(side=tk.LEFT)
 
         self.max_backups_var = tk.IntVar(value=DEFAULT_MAX_BACKUPS)
-        ttk.Spinbox(opts, from_=0, to=99, width=4,
-                    textvariable=self.max_backups_var).pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Spinbox(
+            opts, from_=0, to=99, width=4,
+            textvariable=self.max_backups_var,
+            validate="focusout",
+            validatecommand=(
+                parent.register(self._validate_max_backups), "%P"
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 4))
 
-        ttk.Label(opts, text="backups  (0 = unlimited)").pack(side=tk.LEFT, padx=(0, PAD * 2))
+        ttk.Label(opts, text="backups  (0 = unlimited)").pack(
+            side=tk.LEFT, padx=(0, PAD * 2))
+
+        self.use_subfolder_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts, text="Use 'Windhawk_Backup' subfolder",
+            variable=self.use_subfolder_var,
+            command=self._on_use_subfolder_toggled,
+        ).pack(side=tk.LEFT, padx=(0, PAD))
 
         self.portable_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Portable installation",
-                         variable=self.portable_var,
-                         command=self._on_portable_toggled).pack(side=tk.LEFT, padx=(0, PAD))
+        ttk.Checkbutton(
+            opts, text="Portable installation",
+            variable=self.portable_var,
+            command=self._on_portable_toggled,
+        ).pack(side=tk.LEFT, padx=(0, PAD))
 
         ttk.Button(opts, text="Auto-Detect", width=11,
                    command=self._auto_detect_portable).pack(side=tk.LEFT)
@@ -637,7 +777,8 @@ class WindhawkManagerApp:
                               command=lambda c=col: self._sort_tree(c))
             self.tree.column(col, width=width, minwidth=40, anchor=anchor)
 
-        vsb = ttk.Scrollbar(tv_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        vsb = ttk.Scrollbar(tv_frame, orient=tk.VERTICAL,
+                            command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
@@ -655,11 +796,13 @@ class WindhawkManagerApp:
         self.backup_button.pack(side=tk.LEFT)
 
         self.restore_button = ttk.Button(
-            btn, text="Restore Selected", width=15, command=self._restore_selected)
+            btn, text="Restore Selected", width=15,
+            command=self._restore_selected)
         self.restore_button.pack(side=tk.LEFT, padx=(PAD, 0))
 
         self.delete_button = ttk.Button(
-            btn, text="Delete Selected", width=15, command=self._delete_selected)
+            btn, text="Delete Selected", width=15,
+            command=self._delete_selected)
         self.delete_button.pack(side=tk.LEFT, padx=(PAD, 0))
 
         ttk.Button(btn, text="Refresh", width=9,
@@ -693,17 +836,65 @@ class WindhawkManagerApp:
         bar.pack(fill=tk.X, side=tk.BOTTOM)
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(bar, textvariable=self.status_var,
-                  style="Status.TLabel").pack(side=tk.LEFT, padx=(PAD, 0), pady=2)
+                  style="Status.TLabel").pack(
+            side=tk.LEFT, padx=(PAD, 0), pady=2)
 
     # ------------------------------------------------------------------
     # Config helpers
     # ------------------------------------------------------------------
 
+    def _setup_variable_traces(self) -> None:
+        """Watch config variables and trigger a debounced save on any change."""
+        for var in (
+            self.windhawk_path_var,
+            self.backup_path_var,
+            self.portable_var,
+            self.max_backups_var,
+            self.use_subfolder_var,
+        ):
+            if isinstance(var, tk.BooleanVar):
+                var.trace_add("write", lambda *_: self._schedule_save())
+            else:
+                var.trace_add("write", lambda *_, **__: self._schedule_save())
+
+    def _schedule_save(self) -> None:
+        """Reset the debounce timer; save will occur 1 second after the last change."""
+        if self._save_timer_id is not None:
+            self.root.after_cancel(self._save_timer_id)
+        self._save_timer_id = self.root.after(1000, self._save_config_quietly)
+
+    def _save_config_quietly(self) -> None:
+        """Persist current settings to disk without logging."""
+        self._save_timer_id = None
+        save_config(self._collect_config())
+
     def _apply_config(self) -> None:
-        self.windhawk_path_var.set(self._cfg.get("windhawk_root", DEFAULT_WINDHAWK_ROOT))
-        self.backup_path_var.set(self._cfg.get("backup_folder",  DEFAULT_BACKUP_FOLDER))
-        self.portable_var.set(self._cfg.get("portable",          False))
-        self.max_backups_var.set(self._cfg.get("max_backups",    DEFAULT_MAX_BACKUPS))
+        wh_root = self._cfg.get("windhawk_root", DEFAULT_WINDHAWK_ROOT)
+        if not validate_windhawk_root(wh_root):
+            detected = detect_windhawk_root()
+            if detected:
+                wh_root = detected
+                self.log(f"Info: Auto-detected Windhawk root: {wh_root}", "info")
+            else:
+                self.log(
+                    "Warning: Windhawk root not found — could not auto-detect.",
+                    "warning",
+                )
+        self.windhawk_path_var.set(wh_root)
+
+        # Backward-compatible migration: strip subfolder from stored path
+        raw_backup = self._cfg.get("backup_folder", DEFAULT_BACKUP_FOLDER)
+        use_sub = self._cfg.get("use_subfolder", True)
+        if use_sub and raw_backup and os.path.basename(os.path.normpath(raw_backup)) == BACKUP_SUBFOLDER_NAME:
+            raw_backup = os.path.dirname(raw_backup) or raw_backup   # strip the subfolder
+        self.backup_path_var.set(raw_backup)
+
+        self.portable_var.set(self._cfg.get("portable", False))
+        self.max_backups_var.set(
+            self._cfg.get("max_backups", DEFAULT_MAX_BACKUPS))
+        self.use_subfolder_var.set(
+            self._cfg.get("use_subfolder", True))
+        self.use_subfolder_var.set(use_sub)
         self.log("Info: Configuration loaded.", "info")
 
     def _collect_config(self) -> dict:
@@ -711,10 +902,47 @@ class WindhawkManagerApp:
             "windhawk_root": self.windhawk_path_var.get().strip(),
             "backup_folder": self.backup_path_var.get().strip(),
             "portable":      self.portable_var.get(),
-            "max_backups":   self.max_backups_var.get(),
+            "max_backups":   self._safe_max_backups(),
+            "use_subfolder": self.use_subfolder_var.get(),
         }
 
+    def _safe_max_backups(self) -> int:
+        """Reads max_backups spinbox, clamping non-integer input to default."""
+        try:
+            return max(0, int(self.max_backups_var.get()))
+        except (tk.TclError, ValueError):
+            return DEFAULT_MAX_BACKUPS
+
+    def _get_effective_backup_folder(self) -> str:
+        base = self.backup_path_var.get().strip() or _SCRIPT_DIR
+        if self.use_subfolder_var.get():
+            return os.path.join(base, BACKUP_SUBFOLDER_NAME)
+        return base
+
+    def _on_use_subfolder_toggled(self) -> None:
+        # When disabling subfolder usage, strip the subfolder name from the
+        # displayed path so that the user sees the real base directory.
+        if not self.use_subfolder_var.get():
+            current = self.backup_path_var.get().strip()
+            if current and os.path.basename(os.path.normpath(current)) == BACKUP_SUBFOLDER_NAME:
+                new_base = os.path.dirname(current) or current
+                self.backup_path_var.set(new_base)
+        self._refresh_backup_list()
+
+    def _validate_max_backups(self, value: str) -> bool:
+        """Spinbox validatecommand: clamp bad input to DEFAULT on focus-out."""
+        try:
+            int(value)
+            return True
+        except ValueError:
+            self.max_backups_var.set(DEFAULT_MAX_BACKUPS)
+            return False
+
     def _on_close(self) -> None:
+        # Cancel any pending debounced save and persist immediately
+        if self._save_timer_id is not None:
+            self.root.after_cancel(self._save_timer_id)
+            self._save_timer_id = None
         save_config(self._collect_config())
         self.root.destroy()
 
@@ -724,11 +952,12 @@ class WindhawkManagerApp:
 
     def _refresh_backup_list(self) -> None:
         self.tree.delete(*self.tree.get_children())
-        backups = list_backups(self.backup_path_var.get().strip())
+        backups = list_backups(self._get_effective_backup_folder())
         for i, b in enumerate(backups):
             self.tree.insert(
                 "", tk.END, iid=b["path"],
-                values=(b["date"], b["size"], b["kind"], b["mods"], b["name"]),
+                values=(b["date"], b["size"], b["kind"],
+                        b["mods"], b["name"]),
                 tags=("even" if i % 2 == 0 else "odd",),
             )
         count = len(backups)
@@ -738,12 +967,23 @@ class WindhawkManagerApp:
         )
 
     def _sort_tree(self, col: str) -> None:
-        """Sorts all treeview rows by the clicked column, ascending."""
-        items = [(self.tree.set(iid, col), iid) for iid in self.tree.get_children()]
-        items.sort(key=lambda x: x[0])
+        """
+        Sorts treeview rows by the clicked column.
+        Toggles ascending/descending on repeated clicks.
+        """
+        ascending = self._sort_ascending.get(col, True)
+        items = [
+            (self.tree.set(iid, col), iid)
+            for iid in self.tree.get_children()
+        ]
+        items.sort(key=lambda x: x[0], reverse=not ascending)
         for i, (_val, iid) in enumerate(items):
             self.tree.move(iid, "", i)
             self.tree.item(iid, tags=("even" if i % 2 == 0 else "odd",))
+        # Flip for next click; reset all others to ascending
+        for c in self._sort_ascending:
+            self._sort_ascending[c] = True
+        self._sort_ascending[col] = not ascending
 
     def _selected_archive_path(self) -> str | None:
         sel = self.tree.selection()
@@ -780,23 +1020,30 @@ class WindhawkManagerApp:
     def _auto_detect_portable(self) -> None:
         if registry_key_exists(WINDHAWK_REGISTRY_KEY):
             self.portable_var.set(False)
-            self.log("Info: Registry key found - standard installation detected. Portable mode disabled.", "info")
+            self.log(
+                "Info: Registry key found - standard installation detected. "
+                "Portable mode disabled.", "info")
         else:
             self.portable_var.set(True)
-            self.log("Info: Registry key not found - portable installation assumed. Portable mode enabled.", "warning")
+            self.log(
+                "Info: Registry key not found - portable installation assumed. "
+                "Portable mode enabled.", "warning")
 
     def _on_portable_toggled(self) -> None:
         if self.portable_var.get():
-            self.log("Info: Portable mode enabled - registry steps will be skipped.", "warning")
+            self.log(
+                "Info: Portable mode enabled - registry steps will be skipped.",
+                "warning")
         else:
-            self.log("Info: Portable mode disabled - registry steps will be included.", "info")
+            self.log(
+                "Info: Portable mode disabled - registry steps will be included.",
+                "info")
 
     # ------------------------------------------------------------------
     # Logging and status
     # ------------------------------------------------------------------
 
     def _configure_log_tags(self) -> None:
-        """Configures log colour tags once at startup."""
         for tag, colour in self.LOG_COLOURS.items():
             self.log_widget.tag_config(tag, foreground=colour)
 
@@ -817,7 +1064,9 @@ class WindhawkManagerApp:
         self.root.after(0, lambda: self.status_var.set(text))
 
     def _export_log(self) -> None:
-        default_name = f"wsbu-log-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        default_name = (
+            f"wsbu-log-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
         path = filedialog.asksaveasfilename(
             title="Export Operation Log",
             defaultextension=".txt",
@@ -839,25 +1088,21 @@ class WindhawkManagerApp:
     # ------------------------------------------------------------------
 
     def _show_preview(self) -> None:
-        """
-        Opens a detail window for the selected backup archive.
-        Reads manifest.json from inside the ZIP without extracting it.
-        """
         archive = self._selected_archive_path()
         if not archive:
             return
 
-        # --- Read manifest ---
         manifest: dict = {}
         try:
             with zipfile.ZipFile(archive, "r") as zf:
                 if "manifest.json" in zf.namelist():
-                    manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+                    manifest = json.loads(
+                        zf.read("manifest.json").decode("utf-8"))
         except Exception as exc:
-            messagebox.showerror("Preview Failed", f"Could not read archive:\n{exc}")
+            messagebox.showerror("Preview Failed",
+                                 f"Could not read archive:\n{exc}")
             return
 
-        # --- Build dialog ---
         win = tk.Toplevel(self.root)
         win.title(f"Backup Details  -  {os.path.basename(archive)}")
         win.geometry("480x540")
@@ -869,13 +1114,12 @@ class WindhawkManagerApp:
         outer.pack(fill=tk.BOTH, expand=True)
 
         def _row(parent: ttk.Frame, label: str, value: str, row: int) -> None:
-            ttk.Label(parent, text=label, font=("Segoe UI", 9, "bold"),
-                      anchor="w").grid(row=row, column=0, sticky="w",
-                                       padx=(0, PAD), pady=3)
+            ttk.Label(parent, text=label,
+                      font=("Segoe UI", 9, "bold"), anchor="w").grid(
+                row=row, column=0, sticky="w", padx=(0, PAD), pady=3)
             ttk.Label(parent, text=value, anchor="w").grid(
                 row=row, column=1, sticky="ew", pady=3)
 
-        # --- Metadata grid ---
         meta = ttk.LabelFrame(outer, text="Archive Information", padding=PAD)
         meta.pack(fill=tk.X, pady=(0, PAD))
         meta.columnconfigure(1, weight=1)
@@ -885,17 +1129,20 @@ class WindhawkManagerApp:
         if manifest:
             _row(meta, "Created:",         manifest.get("created",     "-"), 0)
             _row(meta, "Utility Version:", manifest.get("app_version", "-"), 1)
-            _row(meta, "Installation:",    "Portable" if manifest.get("portable") else "Standard", 2)
-            _row(meta, "Mod Count:",       str(manifest.get("mod_count", "-")), 3)
-            _row(meta, "Archive Size:",    _format_size(size_bytes), 4)
+            _row(meta, "Architecture:",    manifest.get("arch", "Unknown"), 2)
+            _row(meta, "Machine:",         manifest.get("hostname", "-"), 3)
+            _row(meta, "Installation:",    "Portable" if manifest.get("portable") else "Standard", 4)
+            _row(meta, "Mod Count:",       str(manifest.get("mod_count", "-")), 5)
+            _row(meta, "Archive Size:",    _format_size(size_bytes), 6)
         else:
-            _row(meta, "Archive:",  os.path.basename(archive), 0)
-            _row(meta, "Size:",     _format_size(size_bytes),  1)
-            ttk.Label(meta, text="No manifest.json found in this archive (legacy backup).",
-                      foreground="DarkOrange").grid(
-                row=2, column=0, columnspan=2, sticky="w", pady=(PAD, 0))
+            _row(meta, "Archive:", os.path.basename(archive), 0)
+            _row(meta, "Size:",    _format_size(size_bytes),  1)
+            ttk.Label(
+                meta,
+                text="No manifest.json found in this archive (legacy backup).",
+                foreground="DarkOrange",
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(PAD, 0))
 
-        # --- Mod list ---
         mods: list[str] = manifest.get("mods", [])
         mod_frame = ttk.LabelFrame(
             outer,
@@ -912,13 +1159,15 @@ class WindhawkManagerApp:
             lb_frame.rowconfigure(0, weight=1)
             lb_frame.columnconfigure(0, weight=1)
 
-            lb = tk.Listbox(lb_frame, font=("Consolas", 9),
-                            selectmode=tk.BROWSE,
-                            relief="flat", borderwidth=0,
-                            background="#FAFAFA", activestyle="none",
-                            highlightthickness=1, highlightcolor="#CCE4F7",
-                            highlightbackground="#DDDDDD")
-            sb = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL, command=lb.yview)
+            lb = tk.Listbox(
+                lb_frame, font=("Consolas", 9),
+                selectmode=tk.BROWSE, relief="flat", borderwidth=0,
+                background="#FAFAFA", activestyle="none",
+                highlightthickness=1, highlightcolor="#CCE4F7",
+                highlightbackground="#DDDDDD",
+            )
+            sb = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL,
+                               command=lb.yview)
             lb.configure(yscrollcommand=sb.set)
             lb.grid(row=0, column=0, sticky="nsew")
             sb.grid(row=0, column=1, sticky="ns")
@@ -926,15 +1175,151 @@ class WindhawkManagerApp:
             for i, mod in enumerate(sorted(mods)):
                 display = mod[:-7] if mod.endswith(".wh.cpp") else mod
                 lb.insert(tk.END, f"  {display}")
-                lb.itemconfig(i, background="#FFFFFF" if i % 2 == 0 else "#F2F6FA")
+                lb.itemconfig(i,
+                              background="#FFFFFF" if i % 2 == 0
+                              else "#F2F6FA")
         else:
-            ttk.Label(mod_frame,
-                      text="No mod list available (legacy backup).",
-                      foreground="DarkOrange").grid(sticky="w")
+            ttk.Label(
+                mod_frame,
+                text="No mod list available (legacy backup).",
+                foreground="DarkOrange",
+            ).grid(sticky="w")
 
-        # --- Close button ---
         ttk.Button(outer, text="Close", width=10,
                    command=win.destroy).pack(anchor="e")
+
+    # ------------------------------------------------------------------
+    # About / Info
+    # ------------------------------------------------------------------
+
+    def _show_help_readme(self) -> None:
+        """Opens the Help & README dialog with tabbed documentation."""
+        candidates_text = "\n".join(
+            f"    {c}" for c in WINDHAWK_ROOT_CANDIDATES
+        )
+        win = tk.Toplevel(self.root)
+        win.title("Help & README - Windhawk Backup Utility")
+        win.geometry("600x500")
+        win.minsize(520, 420)
+        win.resizable(True, True)
+        win.grab_set()
+
+        notebook = ttk.Notebook(win)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=PAD, pady=PAD)
+
+        # ---- Tab 1: Overview ----
+        tab1 = ttk.Frame(notebook)
+        notebook.add(tab1, text="Overview")
+        txt1 = scrolledtext.ScrolledText(
+            tab1, wrap=tk.WORD, font=("Segoe UI", 9),
+            relief="flat", background="#FAFAFA", state=tk.NORMAL,
+        )
+        txt1.pack(fill=tk.BOTH, expand=True)
+        txt1.insert(tk.END, (
+            "WHAT THIS TOOL DOES\n"
+            "\n"
+            "Backs up and restores your Windhawk configuration by\n"
+            "stopping the Windhawk service, copying mod sources,\n"
+            "compiled mods, and registry data into a timestamped ZIP,\n"
+            "then restarting the service.\n"
+            "\n"
+            "Backup filename pattern:\n"
+            "  windhawk-backup_{hostname}_{arch}_{timestamp}.zip\n"
+            "  Example: windhawk-backup_DESKTOP-ABC123_AMD64_20260115_143022.zip\n"
+            "\n"
+            "Manifest inside each archive contains:\n"
+            "  \u2022 hostname, architecture, mod list, portable flag,\n"
+            "    creation time, and the utility version used.\n"
+        ))
+        txt1.config(state=tk.DISABLED)
+
+        # ---- Tab 2: What is backed up ----
+        tab2 = ttk.Frame(notebook)
+        notebook.add(tab2, text="Backed up files")
+        txt2 = scrolledtext.ScrolledText(
+            tab2, wrap=tk.WORD, font=("Segoe UI", 9),
+            relief="flat", background="#FAFAFA", state=tk.NORMAL,
+        )
+        txt2.pack(fill=tk.BOTH, expand=True)
+        txt2.insert(tk.END, (
+            "FILES BACKED UP\n"
+            "  %ProgramData%\\Windhawk\\ModsSource\\\n"
+            "      Mod source code (.wh.cpp)\n"
+            "  %ProgramData%\\Windhawk\\Engine\\Mods\\\n"
+            "      Compiled mod DLLs  \u2190 architecture-specific!\n"
+            "\n"
+            "REGISTRY (standard install)\n"
+            "  HKLM\\SOFTWARE\\Windhawk  (full key tree)\n"
+            "  Covers: Engine\\Mods (mod settings / enabled states),\n"
+            "          Engine\\ModsWritable, Settings (exclusion list)\n"
+            "\n"
+            "PORTABLE INSTALLATIONS\n"
+            "  Registry is NOT included. Only the mod folders\n"
+            "  inside the Windhawk root are archived.\n"
+        ))
+        txt2.config(state=tk.DISABLED)
+
+        # ---- Tab 3: Registry source & backup location ----
+        tab3 = ttk.Frame(notebook)
+        notebook.add(tab3, text="Registry source")
+        txt3 = scrolledtext.ScrolledText(
+            tab3, wrap=tk.WORD, font=("Segoe UI", 9),
+            relief="flat", background="#FAFAFA", state=tk.NORMAL,
+        )
+        txt3.pack(fill=tk.BOTH, expand=True)
+        txt3.insert(tk.END, (
+            "REGISTRY SOURCE KEY\n"
+            "  HKLM\\SOFTWARE\\Windhawk\n"
+            "\n"
+            "How it's backed up:\n"
+            "  During archive creation, we run:\n"
+            "    reg export HKLM\\SOFTWARE\\Windhawk Windhawk.reg /y\n"
+            "  The resulting .reg file is stored at the root of the ZIP.\n"
+            "\n"
+            "How it's restored:\n"
+            "  When you restore a backup, we run:\n"
+            "    reg import Windhawk.reg\n"
+            "  This writes all values back into the exact same registry path.\n"
+            "\n"
+            "NOTE:\n"
+            "  GitHub issue #639 \u2014 \"Stop using the registry as a way\n"
+            "  to store settings for mods\" is open. If Windhawk migrates\n"
+            "  mod settings to plain files, the registry step will no longer\n"
+            "  be needed. This utility will adapt when that happens.\n"
+        ))
+        txt3.config(state=tk.DISABLED)
+
+        # ---- Tab 4: Restore notes ----
+        tab4 = ttk.Frame(notebook)
+        notebook.add(tab4, text="Restore notes")
+        txt4 = scrolledtext.ScrolledText(
+            tab4, wrap=tk.WORD, font=("Segoe UI", 9),
+            relief="flat", background="#FAFAFA", state=tk.NORMAL,
+        )
+        txt4.pack(fill=tk.BOTH, expand=True)
+        txt4.insert(tk.END, (
+            "ARCHITECTURE NOTE\n"
+            "  Compiled DLLs in Engine\\Mods are CPU-specific.\n"
+            "  AMD64 backups will NOT work on ARM64 and vice versa.\n"
+            "  Architecture is recorded in each backup's manifest.json\n"
+            "  and checked automatically on restore. A warning is\n"
+            "  shown if there is a mismatch.\n"
+            "\n"
+            "PORTABLE vs STANDARD\n"
+            "  Restoring a portable backup onto a standard install\n"
+            "  will NOT touch the registry.\n"
+            "\n"
+            "VERSION COMPATIBILITY\n"
+            "  Written and tested against:\n"
+            "    Windhawk v1.7.3  |  Dec 8, 2025  |  commit b59b38c\n"
+            "\n"
+            "ROOT AUTO-DETECT CANDIDATES (probed in order)\n"
+            f"{candidates_text}\n"
+        ))
+        txt4.config(state=tk.DISABLED)
+
+        ttk.Button(win, text="Close", width=10,
+                   command=win.destroy).pack(pady=(0, PAD))
 
     # ------------------------------------------------------------------
     # Operation control
@@ -942,7 +1327,8 @@ class WindhawkManagerApp:
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
-        for btn in (self.backup_button, self.restore_button, self.delete_button):
+        for btn in (self.backup_button, self.restore_button,
+                    self.delete_button):
             btn.config(state=state)
         if enabled:
             self.progressbar.stop()
@@ -956,10 +1342,11 @@ class WindhawkManagerApp:
 
     def _run_backup(self) -> None:
         cfg = self._collect_config()
-        if not cfg["windhawk_root"] or not cfg["backup_folder"]:
+        effective_folder = self._get_effective_backup_folder()
+        if not cfg["windhawk_root"] or not self.backup_path_var.get().strip():
             messagebox.showwarning(
                 "Configuration Incomplete",
-                "Please specify both the Windhawk root and the backup folder.",
+                "Please specify both the Windhawk root and a backup base folder.",
             )
             return
 
@@ -970,23 +1357,27 @@ class WindhawkManagerApp:
         def _worker() -> None:
             success, message = execute_backup_operation(
                 cfg["windhawk_root"],
-                cfg["backup_folder"],
+                effective_folder,
                 portable=cfg["portable"],
                 max_backups=cfg["max_backups"],
             )
-            self.root.after(0, lambda: self._on_backup_done(success, message))
+            self.root.after(0,
+                lambda: self._on_backup_done(success, message))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_backup_done(self, success: bool, message: str) -> None:
         self._set_controls_enabled(True)
         self.log(message, "success" if success else "error")
-        self._set_status("Backup completed." if success else "Backup failed - see log.")
+        self._set_status(
+            "Backup completed." if success else "Backup failed - see log.")
         self._refresh_backup_list()
         if success:
-            messagebox.showinfo("Backup Succeeded", "The backup completed successfully.")
+            messagebox.showinfo("Backup Succeeded",
+                                "The backup completed successfully.")
         else:
-            messagebox.showerror("Backup Failed", "An error occurred. Please review the log.")
+            messagebox.showerror("Backup Failed",
+                                 "An error occurred. Please review the log.")
 
     # ------------------------------------------------------------------
     # Restore
@@ -1008,7 +1399,8 @@ class WindhawkManagerApp:
         name = os.path.basename(archive)
         if not messagebox.askyesno(
             "Confirm Restore",
-            f"Restore from:\n{name}\n\nThis will overwrite existing mod files. Continue?",
+            f"Restore from:\n{name}\n\n"
+            f"This will overwrite existing mod files. Continue?",
         ):
             return
 
@@ -1019,19 +1411,24 @@ class WindhawkManagerApp:
         portable = self.portable_var.get()
 
         def _worker() -> None:
-            success, message = execute_restore_operation(wh_path, archive, portable)
-            self.root.after(0, lambda: self._on_restore_done(success, message))
+            success, message = execute_restore_operation(
+                wh_path, archive, portable)
+            self.root.after(0,
+                lambda: self._on_restore_done(success, message))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_restore_done(self, success: bool, message: str) -> None:
         self._set_controls_enabled(True)
         self.log(message, "success" if success else "error")
-        self._set_status("Restore completed." if success else "Restore failed - see log.")
+        self._set_status(
+            "Restore completed." if success else "Restore failed - see log.")
         if success:
-            messagebox.showinfo("Restore Succeeded", "The restore completed successfully.")
+            messagebox.showinfo("Restore Succeeded",
+                                "The restore completed successfully.")
         else:
-            messagebox.showerror("Restore Failed", "An error occurred. Please review the log.")
+            messagebox.showerror("Restore Failed",
+                                 "An error occurred. Please review the log.")
 
     # ------------------------------------------------------------------
     # Delete
@@ -1070,11 +1467,16 @@ class WindhawkManagerApp:
 if __name__ == "__main__":
     if not is_admin():
         if not run_as_admin():
+            # messagebox requires a root window if tk hasn't started yet
+            _tmp = tk.Tk()
+            _tmp.withdraw()
             messagebox.showerror(
                 "Elevation Failed",
-                "This application requires administrator privileges and could not elevate.\n"
+                "This application requires administrator privileges and "
+                "could not elevate.\n"
                 "Please re-run it manually as Administrator.",
             )
+            _tmp.destroy()
         sys.exit()
 
     root = tk.Tk()
