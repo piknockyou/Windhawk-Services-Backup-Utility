@@ -1,5 +1,5 @@
 # =============================================================================
-#  Windhawk Service Management Utility - Version 2.5.3-pyw
+#  Windhawk Service Management Utility
 #  Based on wsbu.py by scorpion421 (GPL)
 # =============================================================================
 
