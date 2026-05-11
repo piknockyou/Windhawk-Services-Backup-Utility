@@ -1,130 +1,155 @@
-# Windhawk Service Management Utility
+# Windhawk Service Management Utility (Fork)
 
-A lightweight Windows desktop tool for backing up and restoring [Windhawk](https://windhawk.net/) configurations, built with Python and tkinter.
-
-**Please note:** There will be no compiled versions anymore!
+> 📌 **Based on** [wsbu.py](https://github.com/scorpion421/Windhawk-Services-Backup-Utility) by **scorpion421** (GPL)  
+> This fork adds architecture awareness, portable‑first design, smarter auto‑detection, richer UI, and several utility improvements.  
+> **Please note:** There are **no compiled releases** – run the Python source directly.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
-![Version](https://img.shields.io/badge/Version-2.5.0-green)
+![Version](https://img.shields.io/badge/Version-2.5.5--pyw-green)
 ![License](https://img.shields.io/badge/License-GPL-yellow)
 
-<img width="822" height="712" alt="image" src="https://github.com/user-attachments/assets/68776dfd-1299-49fb-85c5-bbb610f67941" />
+<img width="822" height="712" alt="image" src="https://github.com/user-attachments/assets/d844f321-fb90-4db1-a208-199142309970" />
 
 ---
 
 ## Features
 
-- **One-click backup** of mod sources, compiled mods, and registry settings into a timestamped ZIP archive
-- **One-click restore** from any previously created archive
-- **Backup archive list** with sortable columns (date, size, type, mod count, filename)
-- **Backup preview** — double-click any archive to inspect its contents (mod list, creation date, installation type, archive size) without extracting it
-- **Portable installation support** — checkbox and auto-detect button skip registry export/import for portable Windhawk installs
-- **Service management** — automatically stops the Windhawk service before any file operation and restarts it afterwards, even on error
-- **Archive integrity check** — validates every new backup with `zipfile.testzip()` immediately after creation
-- **Installation validation** — verifies the specified Windhawk root path before any operation
-- **Backup rotation** — automatically removes the oldest archives when a configurable limit is exceeded (0 = unlimited)
-- **Backup manifest** — each archive contains a `manifest.json` with creation timestamp, mod list, mod count, and installation type
-- **Persistent settings** — paths, portable flag, and rotation limit are saved to `%AppData%\Windhawk_Backup_Utility\config.json` and restored on next launch
-- **Timestamped operation log** with colour-coded entries (info, success, warning, error) and export to `.txt`
-- **Status bar** showing current state at all times
-- **Threaded operations** — UI remains fully responsive during backup and restore
+### Core backup / restore
+- **One‑click backup** of mod sources, compiled mods, and registry settings into a timestamped ZIP
+- **One‑click restore** from any existing archive  
+- **Service management** – automatically stops Windhawk before file operations and restarts it afterwards, even on errors  
+- **Archive integrity check** – every new backup is validated with `zipfile.testzip()`  
+- **Backup rotation** – keeps only the last *N* archives (configurable, 0 = unlimited)
+
+### Architecture & hostname awareness
+- **Backup filename** now includes **hostname** and **CPU architecture**:  
+  `windhawk-backup_DESKTOP-ABC_AMD64_20260115_143022.zip`  
+- **Manifest enrichment** – each archive’s `manifest.json` records `arch`, `hostname`, mod list, and creation time  
+- **Cross‑architecture warning** – on restore, if the backup was created on a different CPU (e.g. AMD64 → ARM64), a clear warning is logged so you don’t blindly import incompatible binary mods  
+- (see *Architecture note* below for more details)
+
+### Portable‑first & smarter paths
+- **Config lives next to the script** (not hidden in `%AppData%`) – fully portable  
+  – Auto‑migration from the old AppData location on first run  
+- **Default backup folder** is the **script’s directory** (with an optional `Windhawk_Backup` subfolder, toggleable in the UI) – keep backups next to the tool  
+- **Windhawk root auto‑detection** – probes several known install locations on startup if the configured path is invalid
+
+### UI / UX
+- **Help & README** button – opens a tabbed dialog with detailed documentation  
+- **Sortable backup list** – click column headers; toggles ascending / descending  
+- **Backup preview** – double‑click any archive to see its mod list, metadata, and full manifest  
+- **Debounced auto‑save** – settings are saved 1 second after any change  
+- **Spinbox validation** – invalid values in the “keep last” field are reset to the default  
+- **Timestamped operation log** with colour‑coded entries and export to `.txt`  
+- **Status bar** and **threaded operations** – UI stays responsive during backup/restore
+
+### Other improvements
+- **Elevation fix** for `.pyw` files – the `ShellExecuteW` call now correctly separates the interpreter and script paths, so elevation works when launched without a console  
+- Transparent documentation – Help tab explicitly lists Windhawk’s registry usage and the exact directories backed up
 
 ---
 
 ## Requirements
 
-- Windows 10 or 11
-- Python 3.10 or newer (standard library only — no third-party packages required)
-- Administrator privileges (required for registry access and service control)
-
----
-
-## Installation
-
-No installation needed. Clone or download the repository and run the script directly:
-
-```bat
-git clone https://github.com/scorpion421/wsbu.git
-cd wsbu
-python wsbu.py
-```
-
-If Python is not in your PATH, right-click `wsbu.py` and choose **Run as administrator**, or launch it from an elevated command prompt.
-
-The tool will automatically request elevation via UAC if not already running as administrator.
+- Windows 10 / 11  
+- **Python 3.10+** (standard library only – no extra packages)  
+- **Administrator privileges** (for registry and service control)
 
 ---
 
 ## Usage
 
+### First run
+- The tool tries to **auto‑detect** your Windhawk root (checks `%ProgramData%\Windhawk`, `%LocalAppData%\Windhawk`, `C:\Windhawk`, etc.).  
+- Backup folder defaults to the script’s directory with a `Windhawk_Backup` subfolder. You can change the **base folder** and toggle the subfolder on/off.  
+- Settings are saved in a config file next to the script (e.g. `wsbu.config.json`).
+
 ### Backup
-
-1. Verify the **Windhawk Root** path (default: `%ProgramData%\Windhawk`)
-2. Verify the **Backup Folder** path (default: `%UserProfile%\Documents\Windhawk_Backup`)
-3. Set the desired number of backups to keep (0 = unlimited)
-4. Click **Create Backup**
-
-The tool will stop the Windhawk service, copy mod sources and compiled mods, export the registry key, compress everything into a ZIP archive, and restart the service.
+1. Verify the **Windhawk Root** and **Backup Base Folder** fields.  
+2. Optionally adjust the **number of backups to keep** or toggle **Portable installation**.  
+3. Click **Create Backup** – the service is stopped, files copied, registry exported, ZIP created, and the service restarted.
 
 ### Restore
-
-1. Select a backup from the archive list
-2. Click **Restore Selected** (or double-click the entry for a preview first)
-3. Confirm the dialog
-
-The tool will stop the Windhawk service, extract the archive, restore all files, import the registry key, and restart the service.
+1. Select a backup from the list (double‑click to preview its contents first).  
+2. Click **Restore Selected** and confirm the overwrite prompt.  
+3. If the backup’s CPU architecture differs from your machine, a warning will appear in the log – **pay attention to it** (see *Architecture note* below).
 
 ### Portable installations
+- Tick **Portable installation** to skip all registry steps, or click **Auto‑Detect** to let the tool decide (it checks for the registry key).
 
-If Windhawk is running as a portable install (no registry key present):
+### Help
+- Click the **Help & README** button to open a tabbed reference explaining what is backed up, the registry source, restore caveats, and the auto‑detect candidate list.
 
-- Tick **Portable installation** to skip all registry steps, or
-- Click **Auto-Detect** to let the tool check automatically
+---
 
-### Preview
+## Architecture note 🧩
 
-Double-click any archive in the list to open a detail window showing the full mod list, creation date, installation type, and archive size — without extracting the archive.
+Windhawk compiles mods into **native DLLs** located in `Engine\Mods`. These are **CPU‑specific** – an AMD64 DLL will not run on ARM64, and vice versa.
+
+- **Backups** now record the machine’s architecture (`AMD64` or `ARM64`) in both the file name and the manifest.
+- During **restore**, the tool compares the backup’s architecture with your current PC. If they differ, it logs a prominent warning:
+  > *“Architecture mismatch — backup was created on AMD64, this machine is ARM64. Compiled mods may not work.”*
+
+The mod *source* (`ModsSource`) and registry settings are architecture‑agnostic and can be transferred freely – only the compiled DLLs are affected. When moving between architectures, you should **re‑download the mods** after restoring the source and registry.
 
 ---
 
 ## Default paths
 
-| Item | Path |
-|------|------|
-| Windhawk root | `%ProgramData%\Windhawk` |
-| Backup folder | `%UserProfile%\Documents\Windhawk_Backup` |
-| Settings file | `%AppData%\Windhawk_Backup_Utility\config.json` |
-| Archive naming | `windhawk-backup_YYYYMMDD_HHMMSS.zip` |
+| Item | Path / Pattern |
+|------|----------------|
+| Windhawk root (fallback) | `%ProgramData%\Windhawk` |
+| Backup **base** folder | Script directory |
+| Backup subfolder (on by default) | `.\Windhawk_Backup\` |
+| Config file | `wsbu.config.json` (next to the script) |
+| Archive naming | `windhawk-backup_{hostname}_{arch}_{timestamp}.zip` |
 
 ---
 
 ## Changelog
 
-### 2.5.0
-- Added backup archive list with sortable columns and zebra striping
-- Added backup preview dialog (double-click) showing full mod list and metadata
-- Added `manifest.json` inside each archive (creation time, mod list, installation type)
-- Added backup rotation — configurable maximum number of backups to keep
-- Added persistent settings (paths, portable flag, rotation limit saved across sessions)
-- Added timestamped log entries and log export to `.txt`
-- Added status bar
-- Added Windhawk service stop/start around all file operations (via `try/finally`)
-- Added archive integrity check (`zipfile.testzip()`) after every backup
-- Added Windhawk root validation before any operation
-- Added portable installation checkbox and auto-detect button
-- Operations now run on a background thread — UI no longer freezes
-- Improved error handling and reporting throughout
+### 2.5.5‑pyw (this fork)
+- 🏗️ Config now lives next to the script – portable by design; auto‑migration from old AppData location
+- 🧠 Backup filenames enriched with hostname and CPU architecture
+- 📦 Manifest extended with `arch` and `hostname` fields
+- ⚠️ Architecture mismatch warning on restore
+- 🔍 Smarter Windhawk root auto‑detection (multiple candidate paths)
+- 📖 New Help & README button with tabbed documentation
+- ↕️ Treeview columns toggle ascending/descending on click
+- 💾 Debounced auto‑save for all settings
+- ✅ Input validation on backup count spinbox
+- 🔐 Elevation fix for `.pyw` files
+- 🗂️ Optional backup subfolder toggling
+
+### 2.5.0 (upstream)
+- Backup archive list with sortable columns and zebra striping
+- Backup preview dialog (double‑click) showing full mod list and metadata
+- `manifest.json` inside each archive
+- Backup rotation (configurable max backups)
+- Persistent settings (`%AppData%`)
+- Timestamped log entries and log export
+- Status bar
+- Service stop/start around all file operations
+- Archive integrity check
+- Windhawk root validation
+- Portable installation checkbox and auto‑detect
+- Background threading (non‑freezing UI)
 
 ### 2.1.1 (original)
 - Initial release
 
 ---
 
-This script is inspired by the work of https://github.com/lokize - https://github.com/ramensoftware/windhawk/issues/195#issuecomment-3184189085
+## Acknowledgments
+
+- Original idea and UI‑first PowerShell script by [@lokize](https://github.com/lokize) ([comment](https://github.com/ramensoftware/windhawk/issues/195#issuecomment-3184189085))
+- Solid foundational Python tool by [@scorpion421](https://github.com/scorpion421) – this fork is built on that excellent work.
 
 ---
 
 ## License
 
-GPL License — see [LICENSE](LICENSE) for details.
+GPL License – see [LICENSE](LICENSE) for details.
+
+
