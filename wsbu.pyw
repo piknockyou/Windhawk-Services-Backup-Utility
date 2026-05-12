@@ -20,6 +20,8 @@ import threading
 import traceback
 import winreg
 import zipfile
+import time
+from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox, scrolledtext
 import tkinter as tk
 import tkinter.font as tkfont
@@ -52,7 +54,7 @@ from tkinter import ttk
 # ---------------------------------------------------------------------------
 # Application constants
 # ---------------------------------------------------------------------------
-APP_VERSION = "2.8.10-pyw"
+APP_VERSION = "2.8.21-pyw"
 APP_TITLE = f"Windhawk Service Management Utility v{APP_VERSION}"
 
 WINDHAWK_REGISTRY_KEY = r"SOFTWARE\Windhawk"
@@ -170,6 +172,7 @@ def load_config() -> dict:
         "verbose_logging": False,
         "auto_refresh": True,
         "exclude_stale_dlls": True,
+        "restore_clean_first": True,
         "geometry": "820x680",
         "window_state": "normal",
         "tree_column_widths": {},
@@ -446,6 +449,196 @@ def start_windhawk_service() -> tuple[bool, str]:
     return False, f"Warning: Could not restart Windhawk service: {out}"
 
 
+def _run_taskkill(image_name: str) -> tuple[bool, str]:
+    """Force-terminates a process image if running."""
+    try:
+        r = subprocess.run(
+            ["taskkill", "/f", "/im", image_name],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+        output = (r.stdout + r.stderr).strip()
+
+        if r.returncode == 0:
+            return True, f"[PROC] Status: Terminated process '{image_name}'."
+
+        if "not found" in output.lower() or "no running instance" in output.lower():
+            return True, f"[PROC] Info: Process '{image_name}' was not running."
+
+        return False, f"[PROC] Warning: Could not terminate '{image_name}': {output}"
+
+    except OSError as exc:
+        return False, f"[PROC] Warning: taskkill failed for '{image_name}': {exc}"
+
+
+def _is_process_running(image_name: str) -> bool:
+    """Returns True if the given process image is currently running."""
+    try:
+        r = subprocess.run(
+            ["tasklist", "/fi", f"imagename eq {image_name}"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+        return image_name.lower() in r.stdout.lower()
+
+    except OSError:
+        return False
+
+
+def wait_for_process_start(
+    image_name: str,
+    timeout_seconds: float = 10.0,
+    poll_interval: float = 0.2,
+) -> tuple[bool, str]:
+    """
+    Waits until a process image becomes visible in tasklist.
+    Used for Explorer shell recovery verification.
+    """
+    start = time.monotonic()
+
+    while time.monotonic() - start < timeout_seconds:
+        if _is_process_running(image_name):
+            elapsed = time.monotonic() - start
+
+            return (
+                True,
+                f"[WAIT] Status: '{image_name}' process detected after {elapsed:.1f}s.",
+            )
+
+        time.sleep(poll_interval)
+
+    return (
+        False,
+        f"[WAIT] Warning: '{image_name}' did not appear within {timeout_seconds:.1f}s.",
+    )
+
+
+def _shell_tray_exists() -> bool:
+    """
+    Returns True if the Windows taskbar shell window exists.
+    """
+    try:
+        hwnd = ctypes.windll.user32.FindWindowW("Shell_TrayWnd", None)
+        return bool(hwnd)
+    except Exception:
+        return False
+
+
+def wait_for_shell_tray(
+    timeout_seconds: float = 10.0,
+    poll_interval: float = 0.2,
+) -> tuple[bool, str]:
+    """
+    Waits until the Windows taskbar shell window exists.
+    This is a stronger readiness signal than explorer.exe alone.
+    """
+    start = time.monotonic()
+
+    while time.monotonic() - start < timeout_seconds:
+        if _shell_tray_exists():
+            elapsed = time.monotonic() - start
+
+            return (
+                True,
+                f"[WAIT] Status: Shell taskbar window detected after {elapsed:.1f}s.",
+            )
+
+        time.sleep(poll_interval)
+
+    return (
+        False,
+        f"[WAIT] Warning: Shell taskbar window did not appear within {timeout_seconds:.1f}s.",
+    )
+
+
+def restart_explorer_shell() -> list[tuple[str, str]]:
+    """
+    Restarts Explorer as fire-and-forget. The shell loads in the background;
+    the tool does not block on readiness since file operations are already done.
+    """
+    log: list[tuple[str, str]] = []
+
+    try:
+        subprocess.Popen(
+            ["explorer.exe"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        log.append(("success", "[PROC] Status: Explorer relaunch initiated."))
+    except OSError as exc:
+        log.append(("error", f"[PROC] ERROR: Could not launch Explorer shell: {exc}"))
+
+    return log
+
+
+def wait_for_process_exit(
+    image_name: str,
+    timeout_seconds: float = 3.0,
+    poll_interval: float = 0.2,
+) -> tuple[bool, str]:
+    """
+    Waits until a process image fully exits.
+    This prevents races where taskkill returns before DLL unload completes.
+    """
+    start = time.monotonic()
+
+    while time.monotonic() - start < timeout_seconds:
+        if not _is_process_running(image_name):
+            elapsed = time.monotonic() - start
+
+            return (
+                True,
+                f"[WAIT] Status: '{image_name}' fully exited after {elapsed:.1f}s.",
+            )
+
+        time.sleep(poll_interval)
+
+    # Some shell-related Windows processes immediately respawn by design.
+    # We log and continue instead of stalling maintenance indefinitely.
+
+    return (
+        False,
+        f"[WAIT] Warning: '{image_name}' still running after {timeout_seconds:.1f}s timeout. "
+        "Shell teardown may still be in progress.",
+    )
+
+
+def terminate_windhawk_related_processes() -> list[tuple[str, str]]:
+    """
+    Terminates known Windhawk-related host processes that commonly retain
+    locks on injected mod DLLs even after the service stops.
+    """
+    log: list[tuple[str, str]] = []
+
+    for proc in MaintenanceSession.MANAGED_PROCESSES:
+        if proc == "explorer.exe":
+            log.append(
+                (
+                    "info",
+                    "[PROC] Info: Requesting Explorer shell termination...",
+                )
+            )
+
+        ok, msg = _run_taskkill(proc)
+        log.append(("success" if ok else "warning", msg))
+
+        log.append(
+            (
+                "info",
+                f"[WAIT] Info: Waiting for '{proc}' process shutdown...",
+            )
+        )
+
+        wait_ok, wait_msg = wait_for_process_exit(proc)
+
+        log.append(("success" if wait_ok else "warning", wait_msg))
+
+    return log
+
+
 # ---------------------------------------------------------------------------
 # Backup / Restore operations
 # ---------------------------------------------------------------------------
@@ -485,6 +678,8 @@ def execute_backup_operation(
     backed_up_runtime_files = 0
     stale_groups = 0
     stale_dlls_excluded = 0
+    operation_start = time.monotonic()
+    partial_success = False
 
     if not validate_windhawk_root(windhawk_root):
         msg = (
@@ -519,15 +714,34 @@ def execute_backup_operation(
         backup_folder, f"windhawk-backup_{hostname}_{arch}_{timestamp}"
     )
 
-    if not portable:
-        emit("info", "Info: Stopping Windhawk service...")
-        ok, msg = stop_windhawk_service()
-        emit("success" if ok else "warning", msg)
+    session = MaintenanceSession(portable=portable, skip_process_management=True)
 
-        if not ok:
-            emit(
+    emit(
+        "info",
+        "[MAINT] Info: Entering maintenance session...",
+    )
+
+    session.enter()
+
+    for level, message in session.log:
+        emit(level, message)
+
+    session.log.clear()
+
+    emit(
+        "info",
+        "[MAINT] Info: Maintenance session entered.",
+    )
+
+    if not portable and any(
+        "still running after" in message for _level, message in log
+    ):
+        log.append(
+            (
                 "warning",
-                "Warning: Proceeding despite service stop issue. Files may be locked.",
+                "[MAINT] Warning: Some managed processes may still be alive. "
+                "DLL locks may persist.",
+            )
             )
 
     try:
@@ -668,8 +882,10 @@ def execute_backup_operation(
                                                     )
                                                 )
                     except OSError as exc:
-                        log.append(
-                            ("warning", f"Warning: Could not stage '{rel}': {exc}")
+                        partial_success = True
+                        emit(
+                            "warning",
+                            f"Warning: Could not stage '{rel}': {exc}",
                         )
                 else:
                     log.append(("warning", f"Warning: Not found, skipping: {src}"))
@@ -688,7 +904,8 @@ def execute_backup_operation(
 
                 emit("success", "Status: Manifest written.")
             except OSError as exc:
-                log.append(("warning", f"Warning: Could not write manifest: {exc}"))
+                partial_success = True
+                emit("warning", f"Warning: Could not write manifest: {exc}")
 
             emit("info", "Info: Entering registry export stage ...")
 
@@ -717,11 +934,9 @@ def execute_backup_operation(
 
                     emit("success", "Status: Registry exported.")
                 except subprocess.CalledProcessError as exc:
-                    log.append(
-                        (
-                            "error",
-                            f"ERROR: Registry export failed: {exc.stderr.strip()}",
-                        )
+                    emit(
+                        "error",
+                        f"ERROR: Registry export failed: {exc.stderr.strip()}",
                     )
                     return False, log
 
@@ -765,16 +980,22 @@ def execute_backup_operation(
                 with zipfile.ZipFile(archive_path, "r") as zf:
                     bad = zf.testzip()
                 if bad is not None:
-                    log.append(("error", f"ERROR: Archive corrupt - bad entry: {bad}"))
+                    emit("error", f"ERROR: Archive corrupt - bad entry: {bad}")
                     return False, log
-                log.append(("success", "Status: Archive integrity verified."))
+                emit("success", "Status: Archive integrity verified.")
             except zipfile.BadZipFile as exc:
-                log.append(("error", f"ERROR: Archive is not a valid ZIP: {exc}"))
+                emit("error", f"ERROR: Archive is not a valid ZIP: {exc}")
                 return False, log
 
             emit("header", "--- Backup Summary ---")
             emit("summary", f"Summary: Source files backed up: {backed_up_sources}")
             emit("summary", f"Summary: Mod DLLs backed up: {backed_up_mod_dlls}")
+
+            if backed_up_sources == 0 and backed_up_mod_dlls == 0:
+                emit(
+                    "warning",
+                    "Warning: No Windhawk mod sources or compiled mod DLLs were detected.",
+                )
             emit(
                 "summary",
                 f"Summary: Runtime files backed up: {backed_up_runtime_files}",
@@ -790,10 +1011,48 @@ def execute_backup_operation(
         return False, log
 
     finally:
-        if not portable:
-            emit("info", "Info: Restarting Windhawk service ...")
-            _, msg = start_windhawk_service()
-            emit("success", msg)
+        emit(
+            "info",
+            "[MAINT] Info: Exiting maintenance session...",
+        )
+
+        try:
+            session.exit()
+
+            for level, message in session.log:
+                emit(level, message)
+
+            emit(
+                "info",
+                "[MAINT] Info: Maintenance session exited.",
+            )
+
+        except Exception as exc:
+            emit("error", f"[MAINT] ERROR: Maintenance session exit failed: {exc}")
+            emit("error", traceback.format_exc())
+
+    elapsed = time.monotonic() - operation_start
+
+    emit(
+        "summary",
+        f"[SUMMARY] Backup duration: {elapsed:.2f}s",
+    )
+
+    emit(
+        "summary",
+        f"[SUMMARY] Managed processes: {len(MaintenanceSession.MANAGED_PROCESSES)}",
+    )
+
+    emit(
+        "summary",
+        "[SUMMARY] Shell stabilization and maintenance teardown completed.",
+    )
+
+    if partial_success:
+        emit(
+            "warning",
+            "Operation Complete: Backup completed with warnings.",
+        )
 
     # Step 6 – Rotate old backups
     deleted = rotate_backups(backup_folder, max_backups)
@@ -816,6 +1075,84 @@ def _resolve_nested_source(path: str) -> tuple[str, bool]:
     return path, False
 
 
+@dataclass
+class MaintenanceSession:
+    """
+    Centralized maintenance lifecycle controller used by cleanup,
+    restore, and backup operations.
+    """
+
+    MANAGED_PROCESSES = (
+        "windhawk.exe",
+        "windhawk-ui.exe",
+        "explorer.exe",
+    )
+
+    portable: bool = False
+    skip_process_management: bool = False
+    log: list[tuple[str, str]] = field(default_factory=list)
+
+    def emit(self, level: str, message: str) -> None:
+        self.log.append((level, message))
+
+    def enter(self) -> None:
+        self.emit("header", "=== ENTERING MAINTENANCE MODE ===")
+
+        if self.portable:
+            self.emit(
+                "info",
+                "[MAINT] Info: Portable mode enabled - service management skipped.",
+            )
+            return
+
+        if self.skip_process_management:
+            self.emit(
+                "info",
+                "[MAINT] Info: Read-only operation - process termination skipped.",
+            )
+            ok, msg = stop_windhawk_service()
+            self.emit("success" if ok else "warning", f"[MAINT] {msg}")
+            return
+
+        ok, msg = stop_windhawk_service()
+
+        self.emit("success" if ok else "warning", f"[MAINT] {msg}")
+
+        self.emit(
+            "info",
+            "[MAINT] Info: Terminating shell/UI host processes to release DLL handles.",
+        )
+
+        for level, message in terminate_windhawk_related_processes():
+            self.emit(level, message)
+
+        self.emit(
+            "success",
+            "[MAINT] Status: Maintenance mode active. Filesystem operations may begin.",
+        )
+
+    def exit(self) -> None:
+        self.emit("header", "=== EXITING MAINTENANCE MODE ===")
+
+        if not self.portable:
+            _, msg = start_windhawk_service()
+            self.emit("success", f"[MAINT] {msg}")
+
+        if self.skip_process_management:
+            self.emit(
+                "info",
+                "[MAINT] Info: Read-only operation - Explorer restart skipped.",
+            )
+        else:
+            for level, message in restart_explorer_shell():
+                self.emit(level, message)
+
+        self.emit(
+            "info",
+            "[MAINT] Info: Maintenance session teardown completed.",
+        )
+
+
 def cleanup_windhawk_mod_state(
     windhawk_root: str,
     portable: bool = False,
@@ -826,6 +1163,8 @@ def cleanup_windhawk_mod_state(
     deterministic clean baseline instead of merging into stale files.
     """
     log: list[tuple[str, str]] = []
+
+    operation_start = time.monotonic()
 
     if not validate_windhawk_root(windhawk_root):
         return False, [
@@ -851,13 +1190,47 @@ def cleanup_windhawk_mod_state(
         re.IGNORECASE,
     )
 
-    if not portable:
-        ok, msg = stop_windhawk_service()
-        log.append(("success" if ok else "warning", msg))
-        if not ok:
-            log.append(("warning", "Warning: Proceeding despite service stop issue."))
+    session = MaintenanceSession(portable=portable)
+
+    log.append(
+        (
+            "info",
+            "[MAINT] Info: Entering maintenance session...",
+        )
+    )
+
+    session.enter()
+
+    log.extend(session.log)
+
+    session.log.clear()
+
+    log.append(
+        (
+            "info",
+            "[MAINT] Info: Maintenance session entered.",
+        )
+    )
+
+    if not portable and any(
+        "still running after" in message for _level, message in log
+    ):
+        log.append(
+            (
+                "warning",
+                "[MAINT] Warning: Some managed processes may still be alive. "
+                "DLL locks may persist.",
+            )
+        )
 
     try:
+        log.append(
+            (
+                "info",
+                "[FILE] Info: Beginning source file cleanup.",
+            )
+        )
+
         # Remove source files
         mods_source = os.path.join(windhawk_root, "ModsSource")
         if os.path.isdir(mods_source):
@@ -877,6 +1250,13 @@ def cleanup_windhawk_mod_state(
                             f"Warning: Could not remove source file '{name}': {exc}",
                         )
                     )
+
+        log.append(
+            (
+                "info",
+                "[FILE] Info: Beginning compiled DLL cleanup.",
+            )
+        )
 
         # Remove compiled mod DLLs but preserve Windhawk runtime files
         for arch in ("32", "64"):
@@ -898,6 +1278,58 @@ def cleanup_windhawk_mod_state(
                             ("warning", f"Warning: Could not remove '{name}': {exc}")
                         )
 
+                        if getattr(exc, "winerror", None) == 5:
+                            log.append(
+                                (
+                                    "warning",
+                                    "[LOCK] Warning: Access denied usually means the DLL "
+                                    "is still loaded inside an injected target process.",
+                                )
+                            )
+
+                            log.append(
+                                (
+                                    "warning",
+                                    f"[LOCK] Warning: Locked mod binary path: {path}",
+                                )
+                            )
+
+                            active_lock_holders: list[str] = []
+
+                            for proc in (
+                                "explorer.exe",
+                                "ShellExperienceHost.exe",
+                                "StartMenuExperienceHost.exe",
+                                "RuntimeBroker.exe",
+                                "SearchHost.exe",
+                            ):
+                                if _is_process_running(proc):
+                                    active_lock_holders.append(proc)
+
+                            if active_lock_holders:
+                                log.append(
+                                    (
+                                        "warning",
+                                        "[LOCK] Warning: Active potential lock holders detected:",
+                                    )
+                                )
+
+                                for proc in active_lock_holders:
+                                    log.append(
+                                        (
+                                            "warning",
+                                            f"[LOCK] Warning:   - {proc}",
+                                        )
+                                    )
+                            else:
+                                log.append(
+                                    (
+                                        "warning",
+                                        "[LOCK] Warning: No known shell lock holders detected. "
+                                        "Lock may originate from another injected process.",
+                                    )
+                                )
+
         # Remove userprofile.json
         userprofile = os.path.join(windhawk_root, "userprofile.json")
         try:
@@ -907,6 +1339,13 @@ def cleanup_windhawk_mod_state(
             log.append(
                 ("warning", f"Warning: Could not remove userprofile.json: {exc}")
             )
+
+        log.append(
+            (
+                "info",
+                "[REG] Info: Beginning registry cleanup.",
+            )
+        )
 
         # Remove registry mod keys
         if not portable:
@@ -930,9 +1369,62 @@ def cleanup_windhawk_mod_state(
                 )
 
     finally:
-        if not portable:
-            _, msg = start_windhawk_service()
-            log.append(("success", msg))
+        log.append(
+            (
+                "info",
+                "[MAINT] Info: Exiting maintenance session...",
+            )
+        )
+
+        try:
+            session.exit()
+
+            log.extend(session.log)
+
+            log.append(
+                (
+                    "info",
+                    "[MAINT] Info: Maintenance session exited.",
+                )
+            )
+
+        except Exception as exc:
+            log.append(
+                (
+                    "error",
+                    f"[MAINT] ERROR: Maintenance session exit failed: {exc}",
+                )
+            )
+
+            log.append(
+                (
+                    "error",
+                    traceback.format_exc(),
+                )
+            )
+
+    elapsed = time.monotonic() - operation_start
+
+    log.append(
+        (
+            "summary",
+            f"[SUMMARY] Cleanup duration: {elapsed:.2f}s",
+        )
+    )
+
+    log.append(
+        (
+            "summary",
+            f"[SUMMARY] Managed processes: {len(MaintenanceSession.MANAGED_PROCESSES)}",
+        )
+    )
+
+    log.append(
+        (
+            "summary",
+            "[SUMMARY] Shell stabilization and maintenance teardown completed.",
+        )
+    )
 
     log.append(("success", "Operation Complete: Cleanup finished successfully."))
     return True, log
@@ -943,37 +1435,63 @@ def execute_restore_operation(
     archive_path: str,
     portable: bool = False,
     verbose: bool = False,
-) -> tuple[bool, str]:
+    clean_first: bool = True,
+) -> tuple[bool, list[tuple[str, str]]]:
     """
     Restores mod sources, compiled mods, and (unless portable) registry
     settings from a previously created ZIP archive.
     Service is stopped before file access and restarted afterwards.
     """
-    log: list[str] = []
+    log: list[tuple[str, str]] = []
+    operation_start = time.monotonic()
+    partial_success = False
+
+    def emit(level: str, message: str) -> None:
+        log.append((level, message))
 
     if not validate_windhawk_root(windhawk_root):
-        return False, (
-            f"ERROR: Not a valid Windhawk installation:\n{windhawk_root}\n"
-            f"Expected at least one of: {', '.join(WINDHAWK_ROOT_SENTINELS)}"
-        )
-
-    if not portable:
-        ok, msg = stop_windhawk_service()
-        log.append(msg)
-        if not ok:
-            log.append(
-                "Warning: Proceeding despite service stop issue. Files may be locked."
+        return False, [
+            (
+                "error",
+                f"ERROR: Not a valid Windhawk installation:\n{windhawk_root}\n"
+                f"Expected at least one of: {', '.join(WINDHAWK_ROOT_SENTINELS)}",
             )
+        ]
+
+    session = MaintenanceSession(portable=portable)
+
+    emit("info", "[MAINT] Info: Entering maintenance session...")
+
+    session.enter()
+
+    for _level, message in session.log:
+        emit(_level, message)
+
+    session.log.clear()
+
+    emit("info", "[MAINT] Info: Maintenance session entered.")
+
+    if not portable and any(
+        "still running after" in message for message in log
+    ):
+        emit(
+            "warning",
+            "[MAINT] Warning: Some managed processes may still be alive. "
+            "DLL locks may persist.",
+        )
 
     try:
         with tempfile.TemporaryDirectory() as stage_dir:
             # Step 1 – Extract archive
             try:
                 shutil.unpack_archive(archive_path, stage_dir)
-                log.append(f"Status: '{os.path.basename(archive_path)}' extracted.")
+                emit(
+                    "success",
+                    f"Status: '{os.path.basename(archive_path)}' extracted.",
+                )
             except Exception as exc:
-                log.append(f"ERROR: Extraction failed: {exc}")
-                return False, "\n".join(log)
+                emit("error", f"ERROR: Extraction failed: {exc}")
+                return False, log
 
             # Arch mismatch check
             try:
@@ -984,10 +1502,11 @@ def execute_restore_operation(
                     arch_bak = _mf.get("arch", "")
                     arch_cur = platform.machine()
                     if arch_bak and arch_cur and arch_bak != arch_cur:
-                        log.append(
+                        emit(
+                            "warning",
                             f"Warning: Architecture mismatch — backup was created on "
                             f"{arch_bak}, this machine is {arch_cur}. "
-                            f"Compiled mods may not work."
+                            f"Compiled mods may not work.",
                         )
             except Exception:
                 pass
@@ -1006,13 +1525,14 @@ def execute_restore_operation(
                 if os.path.isdir(src):
                     real_src, was_nested = _resolve_nested_source(src)
                     if was_nested:
-                        log.append(
+                        emit(
+                            "info",
                             f"Info: Nested structure detected in '{label}' - "
-                            f"using inner folder to prevent duplication."
+                            f"using inner folder to prevent duplication.",
                         )
                     try:
                         shutil.copytree(real_src, dst, dirs_exist_ok=True)
-                        log.append(f"Status: '{label}' restored.")
+                        emit("success", f"Status: '{label}' restored.")
 
                         if verbose:
                             for root, _dirs, files in os.walk(real_src):
@@ -1021,15 +1541,23 @@ def execute_restore_operation(
                                         os.path.join(root, file),
                                         stage_dir,
                                     )
-                                    log.append(f"Verbose: Restored '{rel_file}'")
+                                    emit("verbose", f"Verbose: Restored '{rel_file}'")
                     except OSError as exc:
-                        log.append(f"Warning: Could not restore '{label}': {exc}")
+                        partial_success = True
+                        emit(
+                            "warning",
+                            f"Warning: Could not restore '{label}': {exc}",
+                        )
                 else:
-                    log.append(f"Warning: '{label}' not found in archive, skipping.")
+                    partial_success = True
+                    emit(
+                        "warning",
+                        f"Warning: '{label}' not found in archive, skipping.",
+                    )
 
             # Step 3 – Import registry key
             if portable:
-                log.append("Info: Portable mode - registry import skipped.")
+                emit("info", "Info: Portable mode - registry import skipped.")
             else:
                 reg_file = os.path.join(stage_dir, "Windhawk.reg")
                 if os.path.isfile(reg_file):
@@ -1041,26 +1569,72 @@ def execute_restore_operation(
                             text=True,
                             creationflags=subprocess.CREATE_NO_WINDOW,
                         )
-                        log.append("Status: Registry imported.")
+                        emit("success", "Status: Registry imported.")
                     except subprocess.CalledProcessError as exc:
-                        log.append(
-                            f"ERROR: Registry import failed: {exc.stderr.strip()}"
+                        emit(
+                            "error",
+                            f"ERROR: Registry import failed: {exc.stderr.strip()}",
                         )
-                        return False, "\n".join(log)
+                        return False, log
                 else:
-                    log.append("Warning: Registry file not found in archive, skipping.")
+                    partial_success = True
+                    emit(
+                        "warning",
+                        "Warning: Registry file not found in archive, skipping.",
+                    )
 
     except OSError as exc:
-        log.append(f"ERROR: Staging directory error: {exc}")
-        return False, "\n".join(log)
+        emit("error", f"ERROR: Staging directory error: {exc}")
+        return False, log
 
     finally:
-        if not portable:
-            _, msg = start_windhawk_service()
-            log.append(msg)
+        emit("info", "[MAINT] Info: Exiting maintenance session...")
 
-    log.append("\nOperation Complete: Restore finished successfully.")
-    return True, "\n".join(log)
+        try:
+            session.exit()
+
+            for _level, message in session.log:
+                emit(_level, message)
+
+            emit("info", "[MAINT] Info: Maintenance session exited.")
+
+        except Exception as exc:
+            emit(
+                "error",
+                f"[MAINT] ERROR: Maintenance session exit failed: {exc}",
+            )
+
+            emit("error", traceback.format_exc())
+
+    elapsed = time.monotonic() - operation_start
+
+    emit(
+        "summary",
+        f"[SUMMARY] Restore duration: {elapsed:.2f}s",
+    )
+
+    emit(
+        "summary",
+        f"[SUMMARY] Managed processes: {len(MaintenanceSession.MANAGED_PROCESSES)}",
+    )
+
+    emit(
+        "summary",
+        "[SUMMARY] Shell stabilization and maintenance teardown completed.",
+    )
+
+    if partial_success:
+        emit(
+            "warning",
+            "Operation Complete: Restore completed with warnings.",
+        )
+    else:
+        emit(
+            "success",
+            "Operation Complete: Restore finished successfully.",
+        )
+
+    return True, log
 
 
 # =============================================================================
@@ -1136,6 +1710,7 @@ class WindhawkManagerApp:
             top_bar, text=" Help & README ", width=16, command=self._show_help_readme
         ).pack(side=tk.RIGHT)
 
+        self._all_config_widgets: list[tk.Widget] = []
         self._build_config_section(outer)
         self._build_archive_section(outer)
         self._build_log_section(outer)
@@ -1144,6 +1719,8 @@ class WindhawkManagerApp:
         self._configure_log_tags()
         self._apply_config()
         self._refresh_backup_list()
+
+        self.root.after(100, self._autosize_all_tree_columns)
 
         self.root.after(3000, self._auto_refresh_backups)
 
@@ -1196,6 +1773,7 @@ class WindhawkManagerApp:
         frame = ttk.LabelFrame(parent, text="Configuration", padding=PAD)
         frame.pack(fill=tk.X, pady=(0, PAD))
         frame.columnconfigure(1, weight=1)
+        self._config_frame = frame
 
         lbl = {"sticky": "w", "padx": (0, PAD), "pady": 4}
         ent = {"sticky": "ew", "pady": 4}
@@ -1349,6 +1927,19 @@ class WindhawkManagerApp:
             "Otherwise -> Portable.",
         )
 
+        # Collect all interactive config widgets for bulk enable/disable
+        def _collect(widget: tk.Widget) -> None:
+            wclass = widget.winfo_class()
+            if wclass in (
+                "TButton", "TEntry", "TCheckbutton", "TSpinbox",
+                "Button", "Entry", "Checkbutton", "Spinbox",
+            ):
+                self._all_config_widgets.append(widget)
+            for child in widget.winfo_children():
+                _collect(child)
+
+        _collect(frame)
+
     def _build_archive_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Backup Archives", padding=PAD)
         frame.pack(fill=tk.BOTH, expand=True, pady=(0, PAD))
@@ -1420,7 +2011,23 @@ class WindhawkManagerApp:
         ToolTip(
             self.restore_button,
             "Restore the selected backup over the current Windhawk install.\n"
-            "TIP: Run 'Clean Existing State' first for a deterministic restore.",
+            "Can optionally perform automatic cleanup before restore.",
+        )
+
+        self.restore_clean_first_var = tk.BooleanVar(value=True)
+
+        restore_clean_cb = ttk.Checkbutton(
+            btn,
+            text="Clean first",
+            variable=self.restore_clean_first_var,
+        )
+        restore_clean_cb.pack(side=tk.LEFT, padx=(PAD, 0))
+
+        ToolTip(
+            restore_clean_cb,
+            "Automatically performs 'Clean Existing State' before restore.\n"
+            "Recommended for deterministic restores and stale DLL removal.\n"
+            "This setting is persisted in the configuration file.",
         )
 
         self.details_button = ttk.Button(
@@ -1569,6 +2176,7 @@ class WindhawkManagerApp:
             self.max_backups_var,
             self.verbose_logging_var,
             self.exclude_stale_dlls_var,
+            self.restore_clean_first_var,
         ):
             if isinstance(var, tk.BooleanVar):
                 var.trace_add("write", lambda *_: self._schedule_save())
@@ -1610,6 +2218,10 @@ class WindhawkManagerApp:
 
         self.exclude_stale_dlls_var.set(self._cfg.get("exclude_stale_dlls", True))
 
+        self.restore_clean_first_var.set(
+            self._cfg.get("restore_clean_first", True)
+        )
+
         self.log("Info: Configuration loaded.", "info")
 
     def _collect_config(self) -> dict:
@@ -1645,6 +2257,7 @@ class WindhawkManagerApp:
             "max_backups": self._safe_max_backups(),
             "verbose_logging": self.verbose_logging_var.get(),
             "exclude_stale_dlls": self.exclude_stale_dlls_var.get(),
+            "restore_clean_first": self.restore_clean_first_var.get(),
             "geometry": geometry,
             "window_state": self.root.state(),
             "tree_column_widths": widths,
@@ -1730,6 +2343,14 @@ class WindhawkManagerApp:
             if self._cfg.get("auto_refresh", True):
                 self.root.after(3000, self._auto_refresh_backups)
 
+    def _autosize_all_tree_columns(self) -> None:
+        """Auto-fits all visible treeview columns to content."""
+        for col in self.TV_COLUMNS:
+            try:
+                self._autosize_tree_column(col)
+            except Exception:
+                pass
+
     def _refresh_backup_list(self) -> None:
         self.tree.delete(*self.tree.get_children())
         backups = list_backups(self._get_effective_backup_folder())
@@ -1752,6 +2373,8 @@ class WindhawkManagerApp:
                 self.tree.column(col, width=saved)
             else:
                 self._autosize_tree_column(col)
+
+        self.root.after(50, self._autosize_all_tree_columns)
 
         count = len(backups)
         self._set_status(
@@ -2246,6 +2869,10 @@ class WindhawkManagerApp:
             (
                 "WHAT THIS TOOL DOES\n"
                 "\n"
+                "By default, restores now automatically perform a\n"
+                "deterministic cleanup before restoring files.\n"
+                "This removes stale DLLs and historical leftovers.\n"
+                "\n"
                 "Backs up and restores your Windhawk configuration by\n"
                 "stopping the Windhawk service, copying mod sources,\n"
                 "compiled mods, registry data, and related metadata into\n"
@@ -2393,6 +3020,14 @@ class WindhawkManagerApp:
                 "ARCHITECTURE NOTE\n"
                 "  Compiled DLLs in Engine\\Mods are CPU-specific.\n"
                 "  AMD64 backups will NOT work on ARM64 and vice versa.\n"
+                "\n"
+                "LOCKED DLLS / ACCESS DENIED\n"
+                "  Windhawk injects mod DLLs into Explorer and other GUI\n"
+                "  processes. Even after the Windhawk service stops,\n"
+                "  injected processes may still retain file handles.\n"
+                "\n"
+                "  v2.8.11 now force-terminates Explorer and Windhawk\n"
+                "  UI processes during cleanup to release DLL locks.\n"
                 "  Architecture is recorded in each backup's manifest.json\n"
                 "  and checked automatically on restore. A warning is\n"
                 "  shown if there is a mismatch.\n"
@@ -2423,6 +3058,8 @@ class WindhawkManagerApp:
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
+
+        # Buttons
         for btn in (
             self.backup_button,
             self.restore_button,
@@ -2431,6 +3068,20 @@ class WindhawkManagerApp:
             self.clean_button,
         ):
             btn.config(state=state)
+
+        # Config entries and browse buttons — walk all children of the config frame
+        for widget in self._all_config_widgets:
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                pass
+
+        # Treeview
+        try:
+            self.tree.config(selectmode="browse" if enabled else "none")
+        except tk.TclError:
+            pass
+
         if enabled:
             self.progressbar.stop()
             self.progressbar.config(value=0)
@@ -2457,6 +3108,14 @@ class WindhawkManagerApp:
 
         def _worker() -> None:
             try:
+                self.root.after(
+                    0,
+                    lambda: self.log(
+                        "[MAINT] Info: Backup worker thread started.",
+                        "info",
+                    ),
+                )
+
                 success, messages = execute_backup_operation(
                     cfg["windhawk_root"],
                     effective_folder,
@@ -2483,16 +3142,14 @@ class WindhawkManagerApp:
     def _on_backup_done(self, success: bool, _messages: list[tuple[str, str]]) -> None:
         self._set_controls_enabled(True)
 
-        self._set_status("Backup completed." if success else "Backup failed - see log.")
+        self.log(
+            "[MAINT] Info: Backup worker thread completed.",
+            "info",
+        )
+
+        self._set_status("Backup completed." if success else "Backup failed — see log.")
         self._refresh_backup_list()
-        if success:
-            messagebox.showinfo(
-                "Backup Succeeded", "The backup completed successfully."
-            )
-        else:
-            messagebox.showerror(
-                "Backup Failed", "An error occurred. Please review the log."
-            )
+        self.root.after(100, self._autosize_all_tree_columns)
 
     # ------------------------------------------------------------------
     # Restore
@@ -2526,32 +3183,38 @@ class WindhawkManagerApp:
         self._set_controls_enabled(False)
 
         portable = self.portable_var.get()
+        clean_first = self.restore_clean_first_var.get()
 
         def _worker() -> None:
-            success, message = execute_restore_operation(
+            success, messages = execute_restore_operation(
                 wh_path,
                 archive,
                 portable,
                 self.verbose_logging_var.get(),
+                clean_first,
             )
-            self.root.after(0, lambda: self._on_restore_done(success, message))
+            self.root.after(0, lambda: self._on_restore_done(success, messages))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_restore_done(self, success: bool, message: str) -> None:
+    def _on_restore_done(
+        self,
+        success: bool,
+        messages: list[tuple[str, str]],
+    ) -> None:
         self._set_controls_enabled(True)
-        self.log(message, "success" if success else "error")
-        self._set_status(
-            "Restore completed." if success else "Restore failed - see log."
+
+        for level, message in messages:
+            self.log(message, level)
+
+        self.log(
+            "[MAINT] Info: Restore worker thread completed.",
+            "info",
         )
-        if success:
-            messagebox.showinfo(
-                "Restore Succeeded", "The restore completed successfully."
-            )
-        else:
-            messagebox.showerror(
-                "Restore Failed", "An error occurred. Please review the log."
-            )
+        self._set_status(
+            "Restore completed." if success else "Restore failed — see log."
+        )
+        self.root.after(100, self._autosize_all_tree_columns)
 
     # ------------------------------------------------------------------
     # Delete
@@ -2583,12 +3246,57 @@ class WindhawkManagerApp:
         portable = self.portable_var.get()
 
         def _worker() -> None:
-            success, messages = cleanup_windhawk_mod_state(
-                wh_path,
-                portable,
-                self.verbose_logging_var.get(),
-            )
-            self.root.after(0, lambda: self._on_cleanup_done(success, messages))
+            try:
+                self.root.after(
+                    0,
+                    lambda: self.log(
+                        "[MAINT] Info: Cleanup worker thread started.",
+                        "info",
+                    ),
+                )
+
+                success, messages = cleanup_windhawk_mod_state(
+                    wh_path,
+                    portable,
+                    self.verbose_logging_var.get(),
+                )
+
+                def _finalize_cleanup() -> None:
+                    self._on_cleanup_done(success, messages)
+
+                self.root.after(
+                    0,
+                    _finalize_cleanup,
+                )
+
+            except Exception:
+                tb = traceback.format_exc()
+
+                self.root.after(
+                    0,
+                    lambda: self.log(
+                        "[ERR] ERROR: Cleanup worker crashed unexpectedly.",
+                        "error",
+                    ),
+                )
+
+                self.root.after(
+                    0,
+                    lambda: self.log(tb, "error"),
+                )
+
+                self.root.after(
+                    0,
+                    lambda: self._on_cleanup_done(
+                        False,
+                        [
+                            (
+                                "error",
+                                "[ERR] ERROR: Cleanup operation crashed.",
+                            )
+                        ],
+                    ),
+                )
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2597,20 +3305,14 @@ class WindhawkManagerApp:
 
         for level, message in messages:
             self.log(message, level)
-        self._set_status(
-            "Cleanup completed." if success else "Cleanup failed - see log."
-        )
 
-        if success:
-            messagebox.showinfo(
-                "Cleanup Succeeded",
-                "Existing Windhawk mod state was removed successfully.",
-            )
-        else:
-            messagebox.showerror(
-                "Cleanup Failed",
-                "An error occurred. Please review the log.",
-            )
+        self.log(
+            "[MAINT] Info: Cleanup worker thread completed.",
+            "info",
+        )
+        self._set_status(
+            "Cleanup completed." if success else "Cleanup failed — see log."
+        )
 
     def _delete_selected(self) -> None:
         archive = self._selected_archive_path()
@@ -2636,6 +3338,9 @@ class WindhawkManagerApp:
             return
 
         self._refresh_backup_list()
+
+        self.root.after(100, self._autosize_all_tree_columns)
+
         self._set_status(f"Deleted: {name}")
 
 
