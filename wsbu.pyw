@@ -54,7 +54,7 @@ from tkinter import ttk
 # ---------------------------------------------------------------------------
 # Application constants
 # ---------------------------------------------------------------------------
-APP_VERSION = "2.8.21-pyw"
+APP_VERSION = "2.8.32-pyw"
 APP_TITLE = f"Windhawk Service Management Utility v{APP_VERSION}"
 
 WINDHAWK_REGISTRY_KEY = r"SOFTWARE\Windhawk"
@@ -70,13 +70,13 @@ _SCRIPT_DIR = (
 DEFAULT_BACKUP_FOLDER = _SCRIPT_DIR
 DEFAULT_MAX_BACKUPS = 10
 
+SCRIPT_BASENAME = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+
 # Candidate paths probed in order when auto-detecting the Windhawk root.
 WINDHAWK_ROOT_CANDIDATES = [
     os.path.expandvars(r"%programdata%\Windhawk"),
     os.path.expandvars(r"%localappdata%\Windhawk"),
     r"C:\Windhawk",
-    r"C:\Program Files\Windhawk",
-    r"C:\Program Files (x86)\Windhawk",
     os.path.join(_SCRIPT_DIR, "Windhawk"),
 ]
 
@@ -158,9 +158,43 @@ class ToolTip:
 # ---------------------------------------------------------------------------
 
 
+# The hostname key used to namespace per-machine paths inside the config.
+_MACHINE_KEY = re.sub(r"[^A-Za-z0-9_-]+", "_", platform.node() or "unknown").strip("_")[
+    :32
+]
+
+
+def _resolve_stored_path(stored: dict, field: str, fallback: str) -> str:
+    """
+    Resolves a path field from the stored config with per-machine awareness.
+
+    Priority:
+      1. Machine-specific path (stored["paths"][_MACHINE_KEY][field])
+      2. Legacy top-level path (stored[field]) — only if it exists on disk
+      3. fallback
+    """
+    # 1) Machine-specific
+    machine_paths: dict = stored.get("paths", {}).get(_MACHINE_KEY, {})
+    if field in machine_paths:
+        p = os.path.expandvars(machine_paths[field])
+        if os.path.exists(p):
+            return p
+        # Path saved for this machine but no longer exists — fall through to legacy/default
+
+    # 2) Legacy top-level (pre-2.8.31 configs written without machine key)
+    if field in stored:
+        p = os.path.expandvars(stored[field])
+        if os.path.exists(p):
+            return p
+
+    return fallback
+
+
 def load_config() -> dict:
     """
     Load settings from the JSON config file next to the script.
+    Path fields (windhawk_root, backup_folder) are stored and resolved
+    per machine so sharing the config across machines is safe.
     Falls back to the old AppData location (v2.5.4 and earlier) if no
     local config exists, then migrates it to the new location.
     """
@@ -177,14 +211,30 @@ def load_config() -> dict:
         "window_state": "normal",
         "tree_column_widths": {},
         "log_window_geometry": "1100x700",
+        "any_zip": True,
     }
+
+    def _apply_stored(stored: dict) -> dict:
+        """Merge stored config into defaults, resolving paths per machine."""
+        merged = dict(defaults)
+        # Apply all non-path keys normally
+        for k, v in stored.items():
+            if k not in ("windhawk_root", "backup_folder", "paths"):
+                merged[k] = v
+        # Resolve path fields per machine
+        merged["windhawk_root"] = _resolve_stored_path(
+            stored, "windhawk_root", DEFAULT_WINDHAWK_ROOT
+        )
+        merged["backup_folder"] = _resolve_stored_path(
+            stored, "backup_folder", DEFAULT_BACKUP_FOLDER
+        )
+        return merged
 
     # 1) Try the new location first (next to the script)
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
             stored = json.load(fh)
-        defaults.update(stored)
-        return defaults
+        return _apply_stored(stored)
     except (OSError, json.JSONDecodeError):
         pass
 
@@ -194,25 +244,23 @@ def load_config() -> dict:
     try:
         with open(legacy_file, "r", encoding="utf-8") as fh:
             stored = json.load(fh)
-        defaults.update(stored)
+        merged = _apply_stored(stored)
         # Migrate to the new location (best effort – failure is non‑fatal)
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
-                json.dump(defaults, fh, indent=2)
+                json.dump(merged, fh, indent=2)
 
-            # Invalidate the legacy config after successful migration so
-            # deleted local configs don't resurrect old settings forever.
             try:
                 migrated_path = legacy_file + ".migrated"
                 if os.path.exists(migrated_path):
                     os.remove(migrated_path)
-
                 os.replace(legacy_file, migrated_path)
             except OSError:
                 pass
 
         except OSError:
             pass
+        return merged
     except (OSError, json.JSONDecodeError):
         pass
 
@@ -220,13 +268,40 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """Persists settings to the JSON config file next to the script. Failure is non-fatal."""
+    """
+    Persists settings to the JSON config file next to the script.
+    Path fields (windhawk_root, backup_folder) are saved under a
+    per-machine key so different machines sharing the same config file
+    (e.g. via Dropbox) each retain their own paths independently.
+    Failure is non-fatal.
+    """
     try:
-        # The directory of CONFIG_FILE is the script directory, which already exists.
-        # We still call makedirs just in case the script was placed in a different spot.
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+
+        # Load the existing file so we can preserve other machines' path entries
+        existing: dict = {}
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+                existing = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        # Build the updated config: all non-path keys are shared across machines
+        out = dict(existing)
+        for k, v in cfg.items():
+            if k not in ("windhawk_root", "backup_folder"):
+                out[k] = v
+
+        # Write path fields under the machine-specific namespace
+        machine_paths: dict = out.setdefault("paths", {})
+        machine_paths[_MACHINE_KEY] = {
+            "windhawk_root": cfg.get("windhawk_root", DEFAULT_WINDHAWK_ROOT),
+            "backup_folder": cfg.get("backup_folder", DEFAULT_BACKUP_FOLDER),
+        }
+
         with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, indent=2)
+            json.dump(out, fh, indent=2)
+
     except OSError:
         pass
 
@@ -237,31 +312,36 @@ def save_config(cfg: dict) -> None:
 
 
 def _format_size(size_bytes: int) -> str:
-    """Formats a byte count as a human-readable string (B / KB / MB / GB)."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes //= 1024
-    return f"{size_bytes:.1f} TB"
+    """Formats a byte count as a human-readable KB string."""
+    kb = size_bytes / 1024
+    return f"{kb:.1f} KB"
 
 
-def list_backups(backup_folder: str) -> list[dict]:
+def list_backups(backup_folder: str, any_zip: bool = False) -> list[dict]:
     """
     Scans the backup folder for archives and returns metadata for each,
     newest first. Reads manifest.json from inside each ZIP if available.
+    If any_zip is True, all .zip files in the folder are listed regardless
+    of filename prefix.
     """
     results: list[dict] = []
     if not os.path.isdir(backup_folder):
         return results
 
-    names = sorted(
-        (
-            n
-            for n in os.listdir(backup_folder)
-            if n.startswith("windhawk-backup_") and n.endswith(".zip")
-        ),
-        reverse=True,
-    )
+    if any_zip:
+        names = sorted(
+            (n for n in os.listdir(backup_folder) if n.endswith(".zip")),
+            reverse=True,
+        )
+    else:
+        names = sorted(
+            (
+                n
+                for n in os.listdir(backup_folder)
+                if n.startswith(f"{SCRIPT_BASENAME}_") and n.endswith(".zip")
+            ),
+            reverse=True,
+        )
     for name in names:
         full_path = os.path.join(backup_folder, name)
         try:
@@ -309,10 +389,23 @@ def list_backups(backup_folder: str) -> list[dict]:
     return results
 
 
-def create_manifest(windhawk_root: str, portable: bool, hostname: str = "") -> dict:
-    """Builds a metadata dict to be stored as manifest.json inside the archive."""
+def create_manifest(
+    windhawk_root: str,
+    portable: bool,
+    hostname: str = "",
+    staged_mods_source: str = "",
+) -> dict:
+    """
+    Builds a metadata dict to be stored as manifest.json inside the archive.
+    If staged_mods_source is provided, mod list is read from the staging
+    directory (post-exclusion) rather than the live installation folder.
+    """
     mods: list[str] = []
-    mods_dir = os.path.join(windhawk_root, "ModsSource")
+    mods_dir = (
+        staged_mods_source
+        if staged_mods_source
+        else os.path.join(windhawk_root, "ModsSource")
+    )
     if os.path.isdir(mods_dir):
         mods = [f for f in os.listdir(mods_dir) if f.endswith(".wh.cpp")]
     mod_names = [f[:-7] for f in mods]  # strip .wh.cpp suffix
@@ -340,7 +433,7 @@ def rotate_backups(backup_folder: str, max_backups: int) -> list[str]:
     archives = sorted(
         f
         for f in os.listdir(backup_folder)
-        if f.startswith("windhawk-backup_") and f.endswith(".zip")
+        if f.startswith(f"{SCRIPT_BASENAME}_") and f.endswith(".zip")
     )
     to_delete = archives[:-max_backups] if len(archives) > max_backups else []
     deleted: list[str] = []
@@ -670,8 +763,13 @@ def execute_backup_operation(
             try:
                 # callback signature is: log(message, level)
                 live_log_callback(message, level)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.append(
+                    (
+                        "warning",
+                        f"[LOG] Warning: live_log_callback failed: {exc}",
+                    )
+                )
 
     backed_up_sources = 0
     backed_up_mod_dlls = 0
@@ -680,6 +778,14 @@ def execute_backup_operation(
     stale_dlls_excluded = 0
     operation_start = time.monotonic()
     partial_success = False
+
+    emit("info", f"[INIT] Info: Windhawk root = {windhawk_root}")
+    emit("info", f"[INIT] Info: Backup folder = {backup_folder}")
+    emit(
+        "info",
+        f"[INIT] Info: portable={portable} max_backups={max_backups} "
+        f"verbose={verbose} exclude_stale_dlls={exclude_stale_dlls}",
+    )
 
     if not validate_windhawk_root(windhawk_root):
         msg = (
@@ -696,32 +802,51 @@ def execute_backup_operation(
         emit("error", f"ERROR: Could not create backup folder: {exc}")
         return False, log
 
-    if os.path.commonpath(
-        [os.path.abspath(windhawk_root), os.path.abspath(backup_folder)]
-    ) == os.path.abspath(windhawk_root):
-        emit(
-            "warning",
-            "Warning: Backup folder is INSIDE the Windhawk directory.\n"
-            "This can cause extremely slow backups or recursive archive growth.\n"
-            "Recommended: choose a folder outside the Windhawk installation.",
-        )
+    try:
+        if os.path.commonpath(
+            [os.path.abspath(windhawk_root), os.path.abspath(backup_folder)]
+        ) == os.path.abspath(windhawk_root):
+            emit(
+                "warning",
+                "Warning: Backup folder is INSIDE the Windhawk directory.\n"
+                "This can cause extremely slow backups or recursive archive growth.\n"
+                "Recommended: choose a folder outside the Windhawk installation.",
+            )
+    except ValueError:
+        pass  # Different drives — backup folder cannot be inside windhawk_root
 
     arch = platform.machine()
     hostname_raw = platform.node() or socket.gethostname() or "unknown"
     hostname = re.sub(r"[^A-Za-z0-9_-]+", "_", hostname_raw).strip("_")[:32]
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     archive_base = os.path.join(
-        backup_folder, f"windhawk-backup_{hostname}_{arch}_{timestamp}"
+        backup_folder, f"{SCRIPT_BASENAME}_{hostname}_{arch}_{timestamp}"
     )
 
-    session = MaintenanceSession(portable=portable, skip_process_management=True)
+    emit(
+        "info",
+        "[MAINT] Info: Creating maintenance session...",
+    )
+
+    session = MaintenanceSession(
+        portable=portable,
+        skip_process_management=True,
+    )
 
     emit(
         "info",
         "[MAINT] Info: Entering maintenance session...",
     )
 
-    session.enter()
+    try:
+        session.enter()
+    except Exception as exc:
+        emit(
+            "error",
+            f"[MAINT] ERROR: session.enter() failed: {exc}",
+        )
+        emit("error", traceback.format_exc())
+        return False, log
 
     for level, message in session.log:
         emit(level, message)
@@ -742,12 +867,56 @@ def execute_backup_operation(
                 "[MAINT] Warning: Some managed processes may still be alive. "
                 "DLL locks may persist.",
             )
-            )
+        )
 
     try:
         with tempfile.TemporaryDirectory() as stage_dir:
             emit("header", "=== BACKUP STARTED ===")
             emit("header", "--- Staging Mod Directories ---")
+
+            known_source_mod_ids: set[str] = set()
+
+            mods_source_scan = os.path.join(windhawk_root, "ModsSource")
+
+            if os.path.isdir(mods_source_scan):
+                for f in os.listdir(mods_source_scan):
+                    if f.endswith(".wh.cpp"):
+                        known_source_mod_ids.add(f[:-7])
+
+            emit(
+                "info",
+                f"[SCAN] Info: Detected {len(known_source_mod_ids)} source mod(s).",
+            )
+
+            known_registry_mod_ids: set[str] = set()
+
+            if not portable:
+                try:
+                    reg_path = WINDHAWK_REGISTRY_KEY + r"\Engine\Mods"
+
+                    with winreg.OpenKey(
+                        winreg.HKEY_LOCAL_MACHINE,
+                        reg_path,
+                    ) as reg_key:
+                        idx = 0
+
+                        while True:
+                            try:
+                                known_registry_mod_ids.add(winreg.EnumKey(reg_key, idx))
+                                idx += 1
+                            except OSError:
+                                break
+
+                    emit(
+                        "info",
+                        f"[SCAN] Info: Detected {len(known_registry_mod_ids)} registry mod(s).",
+                    )
+
+                except OSError as exc:
+                    emit(
+                        "warning",
+                        f"[SCAN] Warning: Could not enumerate registry mods: {exc}",
+                    )
 
             # Step 1 – Stage mod directories
             for rel, src in {
@@ -775,6 +944,30 @@ def execute_backup_operation(
                                         stage_dir,
                                     )
                                     if rel.startswith("ModsSource"):
+                                        if file.endswith(".wh.cpp"):
+                                            mod_id = file[:-7]
+
+                                            if (
+                                                not portable
+                                                and mod_id not in known_registry_mod_ids
+                                            ):
+                                                try:
+                                                    os.remove(os.path.join(root, file))
+
+                                                    emit(
+                                                        "warning",
+                                                        f"[ORPHAN] Warning: Excluded source file '{file}' "
+                                                        f"(no registry entry — mod deleted via UI but source not removed).",
+                                                    )
+
+                                                    continue
+
+                                                except OSError as exc:
+                                                    emit(
+                                                        "warning",
+                                                        f"[ORPHAN] Warning: Could not exclude source file '{file}': {exc}",
+                                                    )
+
                                         backed_up_sources += 1
 
                                         if verbose:
@@ -805,6 +998,42 @@ def execute_backup_operation(
                                             dll_versions.setdefault(
                                                 (arch_dir, mod_id), []
                                             ).append((version, file))
+
+                                            no_source = (
+                                                mod_id not in known_source_mod_ids
+                                            )
+
+                                            no_registry = (
+                                                not portable
+                                                and mod_id not in known_registry_mod_ids
+                                            )
+
+                                            if no_registry:
+                                                stale_dlls_excluded += 1
+
+                                                try:
+                                                    os.remove(os.path.join(root, file))
+
+                                                    if no_source:
+                                                        emit(
+                                                            "warning",
+                                                            f"[ORPHAN] Warning: Excluded orphan DLL '{file}' "
+                                                            f"(no source file and no registry entry — fully deleted mod).",
+                                                        )
+                                                    else:
+                                                        emit(
+                                                            "warning",
+                                                            f"[ORPHAN] Warning: Excluded DLL '{file}' "
+                                                            f"(source exists but no registry entry — mod deleted via UI).",
+                                                        )
+
+                                                except OSError as exc:
+                                                    emit(
+                                                        "warning",
+                                                        f"[ORPHAN] Warning: Could not exclude orphan DLL '{file}': {exc}",
+                                                    )
+
+                                                continue
 
                                             backed_up_mod_dlls += 1
                                         else:
@@ -892,14 +1121,22 @@ def execute_backup_operation(
 
             emit("info", "Info: Entering manifest stage ...")
 
-            # Step 2 – Write manifest
+            # Step 2 – Write manifest (read mod list from staged folder, post-exclusion)
             try:
                 emit("info", "Info: Writing manifest.json ...")
 
+                staged_mods_source = os.path.join(stage_dir, "ModsSource")
                 manifest_path = os.path.join(stage_dir, "manifest.json")
                 with open(manifest_path, "w", encoding="utf-8") as fh:
                     json.dump(
-                        create_manifest(windhawk_root, portable, hostname), fh, indent=2
+                        create_manifest(
+                            windhawk_root,
+                            portable,
+                            hostname,
+                            staged_mods_source=staged_mods_source,
+                        ),
+                        fh,
+                        indent=2,
                     )
 
                 emit("success", "Status: Manifest written.")
@@ -988,7 +1225,22 @@ def execute_backup_operation(
                 return False, log
 
             emit("header", "--- Backup Summary ---")
+
+            staged_cpp = os.path.join(stage_dir, "ModsSource")
+            backed_up_mod_names: list[str] = []
+            if os.path.isdir(staged_cpp):
+                backed_up_mod_names = sorted(
+                    f[:-7] for f in os.listdir(staged_cpp) if f.endswith(".wh.cpp")
+                )
+
             emit("summary", f"Summary: Source files backed up: {backed_up_sources}")
+
+            if backed_up_mod_names:
+                for mod_name in backed_up_mod_names:
+                    emit("summary", f"Summary:   + {mod_name}")
+            else:
+                emit("warning", "Warning: No mod source files in backup.")
+
             emit("summary", f"Summary: Mod DLLs backed up: {backed_up_mod_dlls}")
 
             if backed_up_sources == 0 and backed_up_mod_dlls == 0:
@@ -996,6 +1248,7 @@ def execute_backup_operation(
                     "warning",
                     "Warning: No Windhawk mod sources or compiled mod DLLs were detected.",
                 )
+
             emit(
                 "summary",
                 f"Summary: Runtime files backed up: {backed_up_runtime_files}",
@@ -1157,6 +1410,7 @@ def cleanup_windhawk_mod_state(
     windhawk_root: str,
     portable: bool = False,
     verbose: bool = False,
+    session: MaintenanceSession | None = None,
 ) -> tuple[bool, list[tuple[str, str]]]:
     """
     Removes existing Windhawk mod state so restores can start from a
@@ -1190,27 +1444,32 @@ def cleanup_windhawk_mod_state(
         re.IGNORECASE,
     )
 
-    session = MaintenanceSession(portable=portable)
+    own_session = False
+    if session is None:
+        session = MaintenanceSession(portable=portable)
+        own_session = True
 
-    log.append(
-        (
-            "info",
-            "[MAINT] Info: Entering maintenance session...",
+    if own_session:
+        log.append(
+            (
+                "info",
+                "[MAINT] Info: Entering maintenance session...",
+            )
         )
-    )
 
-    session.enter()
+        session.enter()
 
     log.extend(session.log)
 
     session.log.clear()
 
-    log.append(
-        (
-            "info",
-            "[MAINT] Info: Maintenance session entered.",
+    if own_session:
+        log.append(
+            (
+                "info",
+                "[MAINT] Info: Maintenance session entered.",
+            )
         )
-    )
 
     if not portable and any(
         "still running after" in message for _level, message in log
@@ -1233,17 +1492,21 @@ def cleanup_windhawk_mod_state(
 
         # Remove source files
         mods_source = os.path.join(windhawk_root, "ModsSource")
+        removed_sources: list[str] = []
+        failed_sources: list[str] = []
         if os.path.isdir(mods_source):
             for name in os.listdir(mods_source):
                 path = os.path.join(mods_source, name)
                 try:
                     if os.path.isfile(path):
                         os.remove(path)
+                        removed_sources.append(name)
                         if verbose:
                             log.append(
                                 ("verbose", f"Verbose: Removed source file '{path}'")
                             )
                 except OSError as exc:
+                    failed_sources.append(name)
                     log.append(
                         (
                             "warning",
@@ -1253,12 +1516,31 @@ def cleanup_windhawk_mod_state(
 
         log.append(
             (
+                "summary",
+                f"[CLEAN] Summary: Removed {len(removed_sources)} source file(s)"
+                + (f": {', '.join(removed_sources)}" if removed_sources else "."),
+            )
+        )
+
+        if failed_sources:
+            log.append(
+                (
+                    "warning",
+                    f"[CLEAN] Warning: Failed to remove {len(failed_sources)} source file(s): "
+                    f"{', '.join(failed_sources)}",
+                )
+            )
+
+        log.append(
+            (
                 "info",
                 "[FILE] Info: Beginning compiled DLL cleanup.",
             )
         )
 
         # Remove compiled mod DLLs but preserve Windhawk runtime files
+        removed_dlls: list[str] = []
+        failed_dlls: list[str] = []
         for arch in ("32", "64"):
             mods_dir = os.path.join(windhawk_root, "Engine", "Mods", arch)
             if not os.path.isdir(mods_dir):
@@ -1269,11 +1551,13 @@ def cleanup_windhawk_mod_state(
                     path = os.path.join(mods_dir, name)
                     try:
                         os.remove(path)
+                        removed_dlls.append(f"[{arch}] {name}")
                         if verbose:
                             log.append(
                                 ("verbose", f"Verbose: Removed mod binary '{path}'")
                             )
                     except OSError as exc:
+                        failed_dlls.append(name)
                         log.append(
                             ("warning", f"Warning: Could not remove '{name}': {exc}")
                         )
@@ -1330,6 +1614,23 @@ def cleanup_windhawk_mod_state(
                                     )
                                 )
 
+        log.append(
+            (
+                "summary",
+                f"[CLEAN] Summary: Removed {len(removed_dlls)} compiled DLL(s)"
+                + (f": {', '.join(removed_dlls)}" if removed_dlls else "."),
+            )
+        )
+
+        if failed_dlls:
+            log.append(
+                (
+                    "warning",
+                    f"[CLEAN] Warning: Failed to remove {len(failed_dlls)} DLL(s): "
+                    f"{', '.join(failed_dlls)}",
+                )
+            )
+
         # Remove userprofile.json
         userprofile = os.path.join(windhawk_root, "userprofile.json")
         try:
@@ -1369,39 +1670,40 @@ def cleanup_windhawk_mod_state(
                 )
 
     finally:
-        log.append(
-            (
-                "info",
-                "[MAINT] Info: Exiting maintenance session...",
-            )
-        )
-
-        try:
-            session.exit()
-
-            log.extend(session.log)
-
+        if own_session:
             log.append(
                 (
                     "info",
-                    "[MAINT] Info: Maintenance session exited.",
+                    "[MAINT] Info: Exiting maintenance session...",
                 )
             )
 
-        except Exception as exc:
-            log.append(
-                (
-                    "error",
-                    f"[MAINT] ERROR: Maintenance session exit failed: {exc}",
-                )
-            )
+            try:
+                session.exit()
 
-            log.append(
-                (
-                    "error",
-                    traceback.format_exc(),
+                log.extend(session.log)
+
+                log.append(
+                    (
+                        "info",
+                        "[MAINT] Info: Maintenance session exited.",
+                    )
                 )
-            )
+
+            except Exception as exc:
+                log.append(
+                    (
+                        "error",
+                        f"[MAINT] ERROR: Maintenance session exit failed: {exc}",
+                    )
+                )
+
+                log.append(
+                    (
+                        "error",
+                        traceback.format_exc(),
+                    )
+                )
 
     elapsed = time.monotonic() - operation_start
 
@@ -1471,14 +1773,24 @@ def execute_restore_operation(
 
     emit("info", "[MAINT] Info: Maintenance session entered.")
 
-    if not portable and any(
-        "still running after" in message for message in log
-    ):
+    if not portable and any("still running after" in message for message in log):
         emit(
             "warning",
             "[MAINT] Warning: Some managed processes may still be alive. "
             "DLL locks may persist.",
         )
+
+    if clean_first:
+        emit("info", "Info: Cleaning existing mod state before restore...")
+        clean_ok, clean_log = cleanup_windhawk_mod_state(
+            windhawk_root, portable, verbose, session=session
+        )
+        log.extend(clean_log)
+        if not clean_ok:
+            emit(
+                "warning",
+                "Warning: Cleanup reported failure, proceeding with restore anyway.",
+            )
 
     try:
         with tempfile.TemporaryDirectory() as stage_dir:
@@ -1512,6 +1824,9 @@ def execute_restore_operation(
                 pass
 
             # Step 2 – Restore mod directories
+            restored_sources: list[str] = []
+            restored_dlls: list[str] = []
+
             for label, (src, dst) in {
                 "ModsSource": (
                     os.path.join(stage_dir, "ModsSource"),
@@ -1534,14 +1849,20 @@ def execute_restore_operation(
                         shutil.copytree(real_src, dst, dirs_exist_ok=True)
                         emit("success", f"Status: '{label}' restored.")
 
-                        if verbose:
-                            for root, _dirs, files in os.walk(real_src):
-                                for file in files:
+                        for r, _dirs, files in os.walk(real_src):
+                            for file in files:
+                                if label == "ModsSource" and file.endswith(".wh.cpp"):
+                                    restored_sources.append(file[:-7])
+                                elif file.endswith(".dll"):
+                                    restored_dlls.append(file)
+
+                                if verbose:
                                     rel_file = os.path.relpath(
-                                        os.path.join(root, file),
+                                        os.path.join(r, file),
                                         stage_dir,
                                     )
                                     emit("verbose", f"Verbose: Restored '{rel_file}'")
+
                     except OSError as exc:
                         partial_success = True
                         emit(
@@ -1554,6 +1875,21 @@ def execute_restore_operation(
                         "warning",
                         f"Warning: '{label}' not found in archive, skipping.",
                     )
+
+            emit(
+                "summary",
+                f"[RESTORE] Summary: Restored {len(restored_sources)} mod source(s)"
+                + (
+                    f": {', '.join(sorted(restored_sources))}"
+                    if restored_sources
+                    else "."
+                ),
+            )
+
+            emit(
+                "summary",
+                f"[RESTORE] Summary: Restored {len(restored_dlls)} compiled DLL(s).",
+            )
 
             # Step 3 – Import registry key
             if portable:
@@ -1887,20 +2223,6 @@ class WindhawkManagerApp:
             side=tk.LEFT, padx=(0, PAD * 2)
         )
 
-        self.exclude_stale_dlls_var = tk.BooleanVar(value=True)
-        stale_cb = ttk.Checkbutton(
-            opts,
-            text="Exclude stale DLLs",
-            variable=self.exclude_stale_dlls_var,
-        )
-        stale_cb.pack(side=tk.LEFT, padx=(0, PAD))
-        ToolTip(
-            stale_cb,
-            "When enabled, only the newest compiled DLL of each mod is\n"
-            "included in the backup. Older versions are dropped.\n\n"
-            "Prevents historical binaries from accumulating in restores.",
-        )
-
         self.portable_var = tk.BooleanVar(value=False)
         portable_cb = ttk.Checkbutton(
             opts,
@@ -1931,12 +2253,18 @@ class WindhawkManagerApp:
         def _collect(widget: tk.Widget) -> None:
             wclass = widget.winfo_class()
             if wclass in (
-                "TButton", "TEntry", "TCheckbutton", "TSpinbox",
-                "Button", "Entry", "Checkbutton", "Spinbox",
+                "TButton",
+                "TEntry",
+                "TCheckbutton",
+                "TSpinbox",
+                "Button",
+                "Entry",
+                "Checkbutton",
+                "Spinbox",
             ):
                 self._all_config_widgets.append(widget)
             for child in widget.winfo_children():
-                _collect(child)
+                _collect(child)  # ty: ignore[invalid-argument-type]
 
         _collect(frame)
 
@@ -2004,6 +2332,25 @@ class WindhawkManagerApp:
             "then restarts the service.",
         )
 
+        self.exclude_stale_dlls_var = tk.BooleanVar(value=True)
+        exclude_cb = ttk.Checkbutton(
+            btn,
+            text="Exclude uninstalled mods",
+            variable=self.exclude_stale_dlls_var,
+        )
+        exclude_cb.pack(side=tk.LEFT, padx=(PAD, 0))
+        ToolTip(
+            exclude_cb,
+            "Backup-time filter. When enabled:\n"
+            "  \u2022 Mod source files (.wh.cpp) with no registry entry are excluded\n"
+            "  \u2022 Compiled DLLs with no registry entry are excluded\n"
+            "  \u2022 If multiple DLL versions exist for a mod, only the newest is kept\n\n"
+            "This covers mods that were deleted via the Windhawk UI but whose\n"
+            "files were not cleaned up from disk, as well as fully orphaned\n"
+            "compiled binaries left behind after uninstallation.\n\n"
+            "Recommended: ON. Keeps backups clean and deterministic.",
+        )
+
         self.restore_button = ttk.Button(
             btn, text="Restore Selected", width=16, command=self._restore_selected
         )
@@ -2011,23 +2358,44 @@ class WindhawkManagerApp:
         ToolTip(
             self.restore_button,
             "Restore the selected backup over the current Windhawk install.\n"
-            "Can optionally perform automatic cleanup before restore.",
+            "Optionally wipes existing mod state before restoring.",
         )
 
         self.restore_clean_first_var = tk.BooleanVar(value=True)
 
         restore_clean_cb = ttk.Checkbutton(
             btn,
-            text="Clean first",
+            text="Wipe state before restore",
             variable=self.restore_clean_first_var,
         )
         restore_clean_cb.pack(side=tk.LEFT, padx=(PAD, 0))
-
         ToolTip(
             restore_clean_cb,
-            "Automatically performs 'Clean Existing State' before restore.\n"
-            "Recommended for deterministic restores and stale DLL removal.\n"
-            "This setting is persisted in the configuration file.",
+            "Restore-time option. When enabled:\n"
+            "  Removes ALL existing mod state before extracting the archive:\n"
+            "  \u2022 ModsSource\\*.wh.cpp\n"
+            "  \u2022 Engine\\Mods\\32 and \\64 compiled DLLs\n"
+            "  \u2022 Registry key HKLM\\SOFTWARE\\Windhawk\\Engine\\Mods\n"
+            "  \u2022 userprofile.json\n\n"
+            "Gives a deterministic clean baseline so restored files do not\n"
+            "merge into historical leftovers from a previous installation.\n\n"
+            "Recommended: ON.",
+        )
+
+        self.any_zip_var = tk.BooleanVar(value=True)
+
+        any_zip_cb = ttk.Checkbutton(
+            btn,
+            text="Show all ZIPs",
+            variable=self.any_zip_var,
+            command=self._on_any_zip_toggled,
+        )
+        any_zip_cb.pack(side=tk.LEFT, padx=(PAD, 0))
+        ToolTip(
+            any_zip_cb,
+            "When enabled, ALL .zip files in the backup folder are listed,\n"
+            "not just archives created by this utility.\n"
+            "Useful for restoring from externally sourced backups.",
         )
 
         self.details_button = ttk.Button(
@@ -2177,6 +2545,7 @@ class WindhawkManagerApp:
             self.verbose_logging_var,
             self.exclude_stale_dlls_var,
             self.restore_clean_first_var,
+            self.any_zip_var,
         ):
             if isinstance(var, tk.BooleanVar):
                 var.trace_add("write", lambda *_: self._schedule_save())
@@ -2209,8 +2578,18 @@ class WindhawkManagerApp:
         self.windhawk_path_var.set(wh_root)
 
         raw_backup = self._cfg.get("backup_folder", DEFAULT_BACKUP_FOLDER)
+        expanded_backup = os.path.expandvars(raw_backup)
 
-        self.backup_path_var.set(os.path.expandvars(raw_backup))
+        if not os.path.exists(expanded_backup):
+            self.log(
+                f"Warning: Configured backup folder does not exist on this machine: "
+                f"{expanded_backup}\n"
+                f"  Falling back to script directory: {_SCRIPT_DIR}",
+                "warning",
+            )
+            expanded_backup = _SCRIPT_DIR
+
+        self.backup_path_var.set(expanded_backup)
 
         self.portable_var.set(self._cfg.get("portable", False))
         self.max_backups_var.set(self._cfg.get("max_backups", DEFAULT_MAX_BACKUPS))
@@ -2218,9 +2597,9 @@ class WindhawkManagerApp:
 
         self.exclude_stale_dlls_var.set(self._cfg.get("exclude_stale_dlls", True))
 
-        self.restore_clean_first_var.set(
-            self._cfg.get("restore_clean_first", True)
-        )
+        self.restore_clean_first_var.set(self._cfg.get("restore_clean_first", True))
+
+        self.any_zip_var.set(self._cfg.get("any_zip", True))
 
         self.log("Info: Configuration loaded.", "info")
 
@@ -2258,6 +2637,7 @@ class WindhawkManagerApp:
             "verbose_logging": self.verbose_logging_var.get(),
             "exclude_stale_dlls": self.exclude_stale_dlls_var.get(),
             "restore_clean_first": self.restore_clean_first_var.get(),
+            "any_zip": self.any_zip_var.get(),
             "geometry": geometry,
             "window_state": self.root.state(),
             "tree_column_widths": widths,
@@ -2322,9 +2702,15 @@ class WindhawkManagerApp:
             return set()
 
         result: set[tuple[str, float]] = set()
+        any_zip = self.any_zip_var.get()
 
         for name in os.listdir(folder):
-            if name.startswith("windhawk-backup_") and name.endswith(".zip"):
+            is_match = (
+                name.endswith(".zip")
+                if any_zip
+                else (name.startswith(f"{SCRIPT_BASENAME}_") and name.endswith(".zip"))
+            )
+            if is_match:
                 path = os.path.join(folder, name)
                 try:
                     result.add((name, os.path.getmtime(path)))
@@ -2351,9 +2737,17 @@ class WindhawkManagerApp:
             except Exception:
                 pass
 
+    def _on_any_zip_toggled(self) -> None:
+        self._refresh_backup_list()
+        state = "all ZIP files" if self.any_zip_var.get() else "utility archives only"
+        self.log(f"Info: Backup list filter changed to {state}.", "info")
+
     def _refresh_backup_list(self) -> None:
         self.tree.delete(*self.tree.get_children())
-        backups = list_backups(self._get_effective_backup_folder())
+        backups = list_backups(
+            self._get_effective_backup_folder(),
+            any_zip=self.any_zip_var.get(),
+        )
         for i, b in enumerate(backups):
             self.tree.insert(
                 "",
@@ -2937,6 +3331,25 @@ class WindhawkManagerApp:
                 "  Covers: Engine\\Mods (mod settings / enabled states),\n"
                 "          Engine\\ModsWritable, Settings (exclusion list)\n"
                 "\n"
+                "EXCLUDE UNINSTALLED MODS (backup checkbox)\n"
+                "  When enabled, the following are excluded from the backup:\n"
+                "    \u2022 .wh.cpp source files with no registry entry\n"
+                "      (mod was deleted via UI but source file left on disk)\n"
+                "    \u2022 Compiled DLLs with no registry entry\n"
+                "      (orphaned binaries from uninstalled mods)\n"
+                "    \u2022 If multiple DLL versions exist for one mod,\n"
+                "      only the newest is kept (version-based staleness)\n"
+                "  Recommended: ON.\n"
+                "\n"
+                "WIPE STATE BEFORE RESTORE (restore checkbox)\n"
+                "  Removes all existing mod state before extracting archive:\n"
+                "    \u2022 ModsSource\\*.wh.cpp\n"
+                "    \u2022 Engine\\Mods\\32 and \\64 compiled DLLs\n"
+                "    \u2022 Registry key HKLM\\SOFTWARE\\Windhawk\\Engine\\Mods\n"
+                "    \u2022 userprofile.json\n"
+                "  Gives a clean baseline. Does NOT affect backup.\n"
+                "  Recommended: ON.\n"
+                "\n"
                 "VERBOSE LOGGING\n"
                 "  Verbose logging records every file restored, removed,\n"
                 "  staged, skipped, and processed. Useful for diagnostics.\n"
@@ -3013,9 +3426,9 @@ class WindhawkManagerApp:
             (
                 "CLEAN RESTORE RECOMMENDATION\n"
                 "  Windhawk accumulates stale compiled mod DLLs over time.\n"
-                "  Using 'Clean Existing State' before restoring ensures\n"
-                "  the backup is restored into a deterministic clean baseline\n"
-                "  instead of merging into historical leftovers.\n"
+                "  Using 'Wipe state before restore' ensures the backup is\n"
+                "  restored into a deterministic clean baseline instead of\n"
+                "  merging into historical leftovers.\n"
                 "\n"
                 "ARCHITECTURE NOTE\n"
                 "  Compiled DLLs in Engine\\Mods are CPU-specific.\n"
@@ -3026,7 +3439,7 @@ class WindhawkManagerApp:
                 "  processes. Even after the Windhawk service stops,\n"
                 "  injected processes may still retain file handles.\n"
                 "\n"
-                "  v2.8.11 now force-terminates Explorer and Windhawk\n"
+                "  v2.8.28 now force-terminates Explorer and Windhawk\n"
                 "  UI processes during cleanup to release DLL locks.\n"
                 "  Architecture is recorded in each backup's manifest.json\n"
                 "  and checked automatically on restore. A warning is\n"
@@ -3072,7 +3485,7 @@ class WindhawkManagerApp:
         # Config entries and browse buttons — walk all children of the config frame
         for widget in self._all_config_widgets:
             try:
-                widget.config(state=state)
+                widget.config(state=state)  # ty: ignore[unresolved-attribute]
             except tk.TclError:
                 pass
 
@@ -3103,18 +3516,44 @@ class WindhawkManagerApp:
             return
 
         self.log("\n--- Backup started ---", "info")
+        self.log(f"Info: Windhawk root: {cfg['windhawk_root']}", "info")
+        self.log(f"Info: Backup folder: {effective_folder}", "info")
+        self.log(
+            f"Info: Portable={cfg['portable']}  MaxBackups={cfg['max_backups']}  "
+            f"Verbose={cfg['verbose_logging']}  ExcludeStale={cfg['exclude_stale_dlls']}",
+            "info",
+        )
         self._set_status("Backup in progress...")
         self._set_controls_enabled(False)
 
+        def _direct_log(message: str, level: str = "info") -> None:
+            """
+            Thread-safe log helper that schedules a UI write via after().
+            Unlike self.log(), this does NOT re-enter the prefix-inference
+            logic and writes exactly what execute_backup_operation emits.
+            """
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            text = f"[{ts}]  {message}"
+
+            def _write() -> None:
+                self.log_widget.config(state=tk.NORMAL)
+                self.log_widget.insert(tk.END, text + "\n", (level,))
+                self.log_widget.see(tk.END)
+                self.log_widget.config(state=tk.DISABLED)
+
+            self.root.after(0, _write)
+
         def _worker() -> None:
+            collected: list[tuple[str, str]] = []
+
+            def _live(message: str, level: str = "info") -> None:
+                collected.append((level, message))
+                _direct_log(message, level)
+
             try:
-                self.root.after(
-                    0,
-                    lambda: self.log(
-                        "[MAINT] Info: Backup worker thread started.",
-                        "info",
-                    ),
-                )
+                _direct_log("[MAINT] Info: Backup worker thread started.", "info")
+
+                _direct_log("Info: Calling execute_backup_operation...", "info")
 
                 success, messages = execute_backup_operation(
                     cfg["windhawk_root"],
@@ -3123,24 +3562,45 @@ class WindhawkManagerApp:
                     max_backups=cfg["max_backups"],
                     verbose=cfg["verbose_logging"],
                     exclude_stale_dlls=cfg["exclude_stale_dlls"],
-                    live_log_callback=self.log,
+                    live_log_callback=_live,
                 )
+
+                _direct_log(
+                    f"Info: execute_backup_operation returned success={success}, "
+                    f"{len(messages)} log entries.",
+                    "info",
+                )
+
+                # Emit any entries that were NOT already sent via live callback
+                already = set(id(m) for m in collected)
+                deferred = [m for m in messages if id(m) not in already]
+                for level, message in deferred:
+                    _direct_log(message, level)
 
             except Exception:
                 tb = traceback.format_exc()
-
                 success = False
                 messages = [
                     ("error", "ERROR: Unhandled exception during backup."),
                     ("error", tb),
                 ]
+                _direct_log("ERROR: Unhandled exception during backup.", "error")
+                _direct_log(tb, "error")
 
-            self.root.after(0, lambda: self._on_backup_done(success, messages))
+            self.root.after(0, lambda: self._on_backup_done(success))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_backup_done(self, success: bool, _messages: list[tuple[str, str]]) -> None:
+    def _on_backup_done(
+        self,
+        success: bool,
+        messages: list[tuple[str, str]] | None = None,
+    ) -> None:
         self._set_controls_enabled(True)
+
+        if messages:
+            for level, message in messages:
+                self.log(message, level)
 
         self.log(
             "[MAINT] Info: Backup worker thread completed.",
@@ -3255,10 +3715,27 @@ class WindhawkManagerApp:
                     ),
                 )
 
+                self.root.after(
+                    0,
+                    lambda: self.log(
+                        "Info: Calling cleanup_windhawk_mod_state()...",
+                        "info",
+                    ),
+                )
+
                 success, messages = cleanup_windhawk_mod_state(
                     wh_path,
                     portable,
                     self.verbose_logging_var.get(),
+                )
+
+                self.root.after(
+                    0,
+                    lambda: self.log(
+                        f"Info: cleanup_windhawk_mod_state() returned "
+                        f"success={success} with {len(messages)} log entries.",
+                        "info",
+                    ),
                 )
 
                 def _finalize_cleanup() -> None:
@@ -3293,7 +3770,11 @@ class WindhawkManagerApp:
                             (
                                 "error",
                                 "[ERR] ERROR: Cleanup operation crashed.",
-                            )
+                            ),
+                            (
+                                "error",
+                                tb,
+                            ),
                         ],
                     ),
                 )
